@@ -5,7 +5,6 @@
 # Requires: fzf, jq
 # Install: copy to PATH and chmod +x
 
-set -euo pipefail
 shopt -s nullglob
 
 CLAUDE_PROJECTS="$HOME/.claude/projects"
