@@ -2,7 +2,7 @@
 
 Fast session picker for [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Search and resume any session across all projects with fuzzy finding.
 
-![claude-sessions demo](https://github.com/user-attachments/assets/placeholder)
+<!-- Add a screenshot or GIF here -->
 
 ## Features
 
@@ -41,8 +41,8 @@ chmod +x /usr/local/bin/claude-sessions
 claude-sessions
 
 # Pre-filter search
-claude-sessions rouven
-claude-sessions "booking fix"
+claude-sessions booking
+claude-sessions "auth bug"
 ```
 
 **Controls:**
@@ -51,6 +51,49 @@ claude-sessions "booking fix"
 - `Enter` to resume the selected session
 - `ctrl-/` to toggle the preview panel
 - `Esc` to quit
+
+## Raycast integration
+
+You can launch the session picker from [Raycast](https://raycast.com) with an optional search query.
+
+Create a Raycast script command (e.g., `~/.raycast-scripts/claude-sessions.sh`):
+
+```bash
+#!/bin/bash
+
+# Required parameters:
+# @raycast.schemaVersion 1
+# @raycast.title Claude Sessions
+# @raycast.mode silent
+
+# Optional parameters:
+# @raycast.icon 🤖
+# @raycast.packageName Claude Code
+# @raycast.argument1 { "type": "text", "placeholder": "Search (optional)", "optional": true }
+
+# Documentation:
+# @raycast.description Open Claude Code session picker in terminal
+
+SEARCH_QUERY="${1:-}"
+
+# For iTerm2:
+osascript <<EOF
+tell application "iTerm"
+    activate
+    set newWindow to (create window with default profile)
+    tell newWindow
+        tell current session
+            write text "claude-sessions '$SEARCH_QUERY'"
+        end tell
+    end tell
+end tell
+EOF
+
+# For Terminal.app, replace the above with:
+# osascript -e "tell application \"Terminal\" to do script \"claude-sessions '$SEARCH_QUERY'\""
+```
+
+Then add `~/.raycast-scripts/` as a script directory in Raycast preferences. You'll get a global hotkey to search and resume Claude sessions from anywhere.
 
 ## How it works
 
@@ -91,6 +134,7 @@ Issues and PRs welcome. This started as a personal tool — there's plenty of ro
 - [ ] Session statistics (message count, duration)
 - [ ] Export sessions
 - [ ] Better Linux testing
+- [ ] Terminal.app / Alacritty / Warp Raycast script variants
 
 ## License
 
