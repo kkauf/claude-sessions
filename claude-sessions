@@ -1,0 +1,276 @@
+#!/bin/bash
+# Claude Code Session Picker
+# Fast, cross-project session search and resume for Claude Code
+#
+# Requires: fzf, jq
+# Install: copy to PATH and chmod +x
+
+set -euo pipefail
+shopt -s nullglob
+
+CLAUDE_PROJECTS="$HOME/.claude/projects"
+UNIFIED_CACHE="$HOME/.claude/.sessions-unified-cache.tsv"
+
+# Derive home directory key (how Claude Code encodes paths)
+HOME_KEY=$(echo "$HOME" | sed 's|/|-|g; s|^-||')
+
+for cmd in fzf jq; do
+  command -v "$cmd" &>/dev/null || { echo "$cmd required. Install: brew install $cmd (macOS) or apt install $cmd (Linux)" >&2; exit 1; }
+done
+
+# Detect stat command for epoch (macOS vs Linux)
+if stat -f "%m" /dev/null &>/dev/null 2>&1; then
+  stat_epoch() { stat -f "%m" "$1"; }
+else
+  stat_epoch() { stat -c "%Y" "$1"; }
+fi
+
+# --- Helpers ---
+
+project_label() {
+  local s="${1#-${HOME_KEY}-}"
+  s="${s#github-}"
+  s="${s##*CloudDocs-Documents-}"
+  s="${s##*Documents-}"
+  [[ -z "$s" ]] && s="${1#-${HOME_KEY}-}"
+  [[ -z "$s" ]] && s="$1"
+  echo "$s"
+}
+
+current_label() {
+  project_label "$(basename "$(echo "$PWD" | sed 's|/|-|g; s|^-||')")"
+}
+
+# --- Process one session file → one cache line ---
+# Output: sid \t title \t preview \t keywords \t epoch \t label
+process_file() {
+  local f="$1" label="$2"
+  local sid
+  sid=$(basename "$f" .jsonl)
+
+  # Quick filters
+  [[ "$sid" == agent-* ]] && return
+  grep -q '"type":"user"' "$f" 2>/dev/null || return
+
+  # First user message
+  local first_msg
+  first_msg=$(grep -m1 '"type":"user"' "$f" | jq -r '
+    .message.content
+    | if type == "string" then .[0:200]
+      elif type == "array" then
+        (map(select(.type == "text")) | .[0].text // empty) | .[0:200]
+      else empty end' 2>/dev/null)
+  first_msg=$(echo "$first_msg" | tr '\n' ' ' | sed 's/  */ /g; s/^ *//; s/ *$//')
+
+  # Skip noise sessions
+  [[ -z "$first_msg" ]] && return
+  [[ "$first_msg" == "<local-command-caveat>"* ]] && return
+  [[ "$first_msg" == "Caveat: The messages below"* ]] && return
+  [[ "$first_msg" == "[Request interrupted"* ]] && return
+  [[ "$first_msg" == "Warmup" ]] && return
+
+  # Resume sessions: show second user message as preview
+  local preview="$first_msg"
+  if [[ "$first_msg" == "claude --resume"* ]]; then
+    local second
+    second=$(grep '"type":"user"' "$f" | sed -n '2p' | jq -r '
+      .message.content
+      | if type == "string" then .[0:200]
+        elif type == "array" then
+          (map(select(.type == "text")) | .[0].text // empty) | .[0:200]
+        else empty end' 2>/dev/null)
+    second=$(echo "$second" | tr '\n' ' ' | sed 's/  */ /g; s/^ *//; s/ *$//')
+    [[ -n "$second" ]] && preview="$second"
+  fi
+  [[ "$preview" == "[Request interrupted"* ]] && return
+  [[ "$preview" == "claude --resume"* ]] && return
+
+  # Title: custom-title > auto-summary
+  local ct as title
+  ct=$(grep -m1 '"type":"custom-title"' "$f" 2>/dev/null | jq -r '.customTitle // empty' 2>/dev/null)
+  as=$(grep -m1 '"type":"summary"' "$f" 2>/dev/null | jq -r '.summary // empty' 2>/dev/null)
+  title="${ct:-$as}"
+
+  # Keywords: extract actual text from all user messages (skip base64/binary)
+  local keywords
+  keywords=$(jq -r 'select(.type == "user") | .message.content
+    | if type == "string" then .
+      elif type == "array" then [.[] | select(.type == "text") | .text] | join(" ")
+      else empty end' "$f" 2>/dev/null \
+    | tr '[:upper:]' '[:lower:]' \
+    | grep -oE '[a-z]{4,30}' \
+    | sort -u | tr '\n' ' ')
+
+  local epoch
+  epoch=$(stat_epoch "$f")
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$sid" "$title" "$preview" "$keywords" "$epoch" "$label"
+}
+
+# --- Cache management ---
+
+build_full_cache() {
+  local tmpfile
+  tmpfile=$(mktemp)
+  for d in "$CLAUDE_PROJECTS"/*/; do
+    [[ ! -d "$d" ]] && continue
+    local key label
+    key=$(basename "$d")
+    label=$(project_label "$key")
+    while IFS= read -r f; do
+      process_file "$f" "$label"
+    done < <(ls -t "$d"*.jsonl 2>/dev/null)
+  done > "$tmpfile"
+  sort -t$'\t' -k5,5 -rn "$tmpfile" > "$UNIFIED_CACHE"
+  rm "$tmpfile"
+}
+
+do_incremental() {
+  local new_entries changed_sids
+  new_entries=$(mktemp)
+  changed_sids=$(mktemp)
+
+  for d in "$CLAUDE_PROJECTS"/*/; do
+    [[ ! -d "$d" ]] && continue
+    local key label
+    key=$(basename "$d")
+    label=$(project_label "$key")
+    for f in "$d"*.jsonl; do
+      [[ -f "$f" ]] || continue
+      if [[ "$f" -nt "$UNIFIED_CACHE" ]]; then
+        basename "$f" .jsonl >> "$changed_sids"
+        process_file "$f" "$label" >> "$new_entries"
+      fi
+    done
+  done
+
+  if [[ ! -s "$changed_sids" ]]; then
+    rm "$new_entries" "$changed_sids"
+    return
+  fi
+
+  local n_changed
+  n_changed=$(wc -l < "$changed_sids" | tr -d ' ')
+  if [[ "$n_changed" -gt 20 ]]; then
+    rm "$new_entries" "$changed_sids"
+    build_full_cache
+    return
+  fi
+
+  local merged
+  merged=$(mktemp)
+  cat "$new_entries" > "$merged"
+  awk -F'\t' 'NR==FNR{sids[$0];next} !($1 in sids)' "$changed_sids" "$UNIFIED_CACHE" >> "$merged"
+  sort -t$'\t' -k5,5 -rn "$merged" > "$UNIFIED_CACHE"
+  rm "$new_entries" "$changed_sids" "$merged"
+}
+
+if [[ ! -f "$UNIFIED_CACHE" ]]; then
+  build_full_cache
+else
+  do_incremental
+fi
+
+if [[ ! -s "$UNIFIED_CACHE" ]]; then
+  echo "No sessions found." >&2
+  exit 1
+fi
+
+session_count=$(wc -l < "$UNIFIED_CACHE" | tr -d ' ')
+
+# --- Derive current project label for tagging ---
+CL=$(current_label)
+
+# --- Format for fzf ---
+#
+# Architecture: 2-field fzf input
+#   F1: session_id     (hidden via --with-nth=2)
+#   F2: display + 300 spaces padding + search keywords
+#
+# --with-nth=2 hides F1 (SID) and shows only F2.
+# The 300-space padding pushes keywords off-screen, but fzf still searches them.
+# --no-hscroll prevents fzf from scrolling to show off-screen keyword matches.
+# --tiebreak=begin,index ranks title/preview matches above keyword-only matches.
+#
+# Preview uses bash -c explicitly (fzf defaults to $SHELL which may be zsh).
+
+PAD=$(printf '%300s' '')
+
+selected=$(awk -F'\t' -v cl="$CL" -v now="$(date +%s)" -v pad="$PAD" -v home_key="$HOME_KEY" '
+function reldate(ep,    d) {
+  d = int((now - ep) / 86400)
+  if (d == 0) return "today"
+  if (d == 1) return " 1d  "
+  if (d < 7) return sprintf("%2dd  ", d)
+  if (d < 30) return sprintf("%2dw  ", int(d/7))
+  if (d < 365) return sprintf("%2dmo ", int(d/30))
+  return sprintf("%2dy  ", int(d/365))
+}
+{
+  sid=$1; title=$2; preview=$3; kw=$4; epoch=$5; proj=$6
+
+  rd = reldate(epoch)
+
+  # Project tag (only for other projects)
+  tag = ""
+  if (proj != cl && proj != "") tag = "  \033[2m\302\267 " proj "\033[0m"
+
+  # Display: date + title or preview + optional project tag
+  if (title != "") {
+    line = sprintf("\033[33m%-5s\033[0m \033[1m%s\033[0m%s", rd, title, tag)
+  } else {
+    p = preview
+    if (length(p) > 80) p = substr(p, 1, 77) "..."
+    line = sprintf("\033[33m%-5s\033[0m %s%s", rd, p, tag)
+  }
+
+  # Append padding + search text (off-screen, but fzf still searches it)
+  search = title " " preview " " kw " " proj
+  printf "%s\t%s%s%s\n", sid, line, pad, search
+}' "$UNIFIED_CACHE" | fzf \
+  --ansi \
+  --delimiter='\t' \
+  --with-nth=2 \
+  --exact \
+  --no-hscroll \
+  --tiebreak=begin,index \
+  --header="$session_count sessions · ctrl-/ toggle preview" \
+  --bind="ctrl-/:toggle-preview" \
+  --query="${1:-}" \
+  --height=80% \
+  --reverse \
+  --border \
+  --prompt="sessions > " \
+  --pointer=">" \
+  --color="header:yellow,prompt:blue,pointer:green" \
+  --preview='bash -c '\''
+    shopt -s nullglob
+    sid="$1"
+    home_key="$2"
+    files=("$HOME/.claude/projects"/*/${sid}.jsonl)
+    f="${files[0]}"
+    if [[ -n "$f" && -f "$f" ]]; then
+      d=$(basename "$(dirname "$f")")
+      d="${d#-${home_key}-}"; d="${d#github-}"
+      d="${d##*CloudDocs-Documents-}"; d="${d##*Documents-}"
+      echo -e "\033[2m$d\033[0m"
+      echo ""
+      grep "\"type\":\"user\"" "$f" 2>/dev/null | head -12 | jq -r "
+        .message.content
+        | if type == \"string\" then .[0:500]
+          elif type == \"array\" then
+            [.[] | select(.type == \"text\") | .text] | join(\" \") | .[0:500]
+          else empty end" 2>/dev/null | while IFS= read -r line; do
+        [[ -n "$line" ]] && echo -e "\033[36m>\033[0m $line" && echo
+      done
+    else
+      echo "Session file not found"
+    fi
+  '\'' _ {1} '"$HOME_KEY" \
+  --preview-window=right:40%:wrap)
+
+if [[ -n "$selected" ]]; then
+  session_id=$(echo "$selected" | cut -d$'\t' -f1)
+  exec claude --resume "$session_id"
+fi
