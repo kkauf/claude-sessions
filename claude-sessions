@@ -97,7 +97,7 @@ process_file() {
       elif type == "array" then [.[] | select(.type == "text") | .text] | join(" ")
       else empty end' "$f" 2>/dev/null \
     | tr '[:upper:]' '[:lower:]' \
-    | grep -oE '[a-z]{4,30}' \
+    | grep -oE '[a-z0-9][a-z0-9_-]{2,40}' \
     | sort -u | tr '\n' ' ')
 
   local epoch
@@ -232,6 +232,7 @@ function reldate(ep,    d) {
   --delimiter='\t' \
   --with-nth=2 \
   --exact \
+  -i \
   --no-hscroll \
   --tiebreak=begin,index \
   --header="$session_count sessions · ctrl-/ toggle preview" \
