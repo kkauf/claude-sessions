@@ -272,5 +272,21 @@ function reldate(ep,    d) {
 
 if [[ -n "$selected" ]]; then
   session_id=$(echo "$selected" | cut -d$'\t' -f1)
+
+  # Find the session file and extract its original working directory.
+  # claude --resume scopes to the current project, so we must cd to the
+  # directory the session was created in.
+  session_cwd=""
+  shopt -s nullglob
+  session_files=("$CLAUDE_PROJECTS"/*/${session_id}.jsonl)
+  if [[ ${#session_files[@]} -gt 0 && -f "${session_files[0]}" ]]; then
+    session_cwd=$(grep -m1 '"cwd"' "${session_files[0]}" \
+      | jq -r '.cwd // empty' 2>/dev/null)
+  fi
+
+  if [[ -n "$session_cwd" && -d "$session_cwd" ]]; then
+    cd "$session_cwd"
+  fi
+
   exec claude --resume "$session_id"
 fi
