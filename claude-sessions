@@ -99,11 +99,11 @@ process_file() {
     title="${title:0:120}"
   fi
 
-  # Keywords: extract actual text from all user messages (skip base64/binary)
+  # Keywords: extract text from user messages + assistant messages (text blocks only)
   local keywords
-  keywords=$(jq -r 'select(.type == "user") | .message.content
-    | if type == "string" then .
-      elif type == "array" then [.[] | select(.type == "text") | .text] | join(" ")
+  keywords=$(jq -r 'select(.type == "user" or .type == "assistant") | .message.content
+    | if type == "string" then .[0:500]
+      elif type == "array" then [.[] | select(.type == "text") | .text[0:500]] | join(" ")
       else empty end' "$f" 2>/dev/null \
     | tr '[:upper:]' '[:lower:]' \
     | grep -oE '[a-z0-9][a-z0-9_-]{2,40}' \
@@ -246,7 +246,7 @@ function reldate(ep,    d) {
   --tiebreak=begin,index \
   --header="$session_count sessions · ctrl-/ toggle preview" \
   --bind="ctrl-/:toggle-preview" \
-  --query="${1:-}" \
+  --query="$(echo "${1:-}" | tr -d '.,;:!?()\"' | tr "'" " " | tr '[:upper:]' '[:lower:]' | tr -s ' ' '\n' | grep -xvE '(.{0,2}|the|and|are|not|was|for|that|this|with|from|but|have|has|had|been|will|would|could|should|into|your|they|them|their|what|when|where|which|does|also|just|than|then|each|only|very|here|there|some|other|about|more|over|such)' | sort -u | tr '\n' ' ')" \
   --height=80% \
   --reverse \
   --border \
