@@ -84,11 +84,20 @@ process_file() {
   [[ "$preview" == "[Request interrupted"* ]] && return
   [[ "$preview" == "claude --resume"* ]] && return
 
-  # Title: custom-title > auto-summary
+  # Title: custom-title > auto-summary > plan heading
   local ct as title
   ct=$(grep -m1 '"type":"custom-title"' "$f" 2>/dev/null | jq -r '.customTitle // empty' 2>/dev/null)
   as=$(grep -m1 '"type":"summary"' "$f" 2>/dev/null | jq -r '.summary // empty' 2>/dev/null)
   title="${ct:-$as}"
+
+  # Auto-extract plan heading as title for plan execution sessions
+  if [[ -z "$title" && "$first_msg" == "Implement the following plan:"* ]]; then
+    local plan_text="${first_msg#Implement the following plan:}"
+    plan_text="${plan_text# }"
+    plan_text="${plan_text#\# }"
+    title="${plan_text%% ## *}"
+    title="${title:0:120}"
+  fi
 
   # Keywords: extract actual text from all user messages (skip base64/binary)
   local keywords
@@ -256,6 +265,12 @@ function reldate(ep,    d) {
       d="${d##*CloudDocs-Documents-}"; d="${d##*Documents-}"
       echo -e "\033[2m$d\033[0m"
       echo ""
+      # Warn about compacted sessions
+      compact_n=$(grep -c "\"compact_boundary\"" "$f" 2>/dev/null || echo 0)
+      if [[ "$compact_n" -gt 0 ]]; then
+        echo -e "\033[33m⚠ ${compact_n}x compacted — long session\033[0m"
+        echo ""
+      fi
       grep "\"type\":\"user\"" "$f" 2>/dev/null | head -12 | jq -r "
         .message.content
         | if type == \"string\" then .[0:500]
