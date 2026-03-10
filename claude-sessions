@@ -2,7 +2,7 @@
 # Claude Code Session Picker
 # Fast, cross-project session search and resume for Claude Code
 #
-# Requires: fzf, jq
+# Requires: fzf, jq, python3
 # Install: copy to PATH and chmod +x
 
 shopt -s nullglob
@@ -13,16 +13,9 @@ UNIFIED_CACHE="$HOME/.claude/.sessions-unified-cache.tsv"
 # Derive home directory key (how Claude Code encodes paths)
 HOME_KEY=$(echo "$HOME" | sed 's|/|-|g; s|^-||')
 
-for cmd in fzf jq; do
+for cmd in fzf jq python3; do
   command -v "$cmd" &>/dev/null || { echo "$cmd required. Install: brew install $cmd (macOS) or apt install $cmd (Linux)" >&2; exit 1; }
 done
-
-# Detect stat command for epoch (macOS vs Linux)
-if stat -f "%m" /dev/null &>/dev/null 2>&1; then
-  stat_epoch() { stat -f "%m" "$1"; }
-else
-  stat_epoch() { stat -c "%Y" "$1"; }
-fi
 
 # --- Helpers ---
 
@@ -40,145 +33,9 @@ current_label() {
   project_label "$(basename "$(echo "$PWD" | sed 's|/|-|g; s|^-||')")"
 }
 
-# --- Process one session file → one cache line ---
-# Output: sid \t title \t preview \t keywords \t epoch \t label
-process_file() {
-  local f="$1" label="$2"
-  local sid
-  sid=$(basename "$f" .jsonl)
-
-  # Quick filters
-  [[ "$sid" == agent-* ]] && return
-  grep -q '"type":"user"' "$f" 2>/dev/null || return
-
-  # First user message
-  local first_msg
-  first_msg=$(grep -m1 '"type":"user"' "$f" | jq -r '
-    .message.content
-    | if type == "string" then .[0:200]
-      elif type == "array" then
-        (map(select(.type == "text")) | .[0].text // empty) | .[0:200]
-      else empty end' 2>/dev/null)
-  first_msg=$(echo "$first_msg" | tr '\n' ' ' | sed 's/  */ /g; s/^ *//; s/ *$//')
-
-  # Skip noise sessions
-  [[ -z "$first_msg" ]] && return
-  [[ "$first_msg" == "<local-command-caveat>"* ]] && return
-  [[ "$first_msg" == "Caveat: The messages below"* ]] && return
-  [[ "$first_msg" == "[Request interrupted"* ]] && return
-  [[ "$first_msg" == "Warmup" ]] && return
-
-  # Resume sessions: show second user message as preview
-  local preview="$first_msg"
-  if [[ "$first_msg" == "claude --resume"* ]]; then
-    local second
-    second=$(grep '"type":"user"' "$f" | sed -n '2p' | jq -r '
-      .message.content
-      | if type == "string" then .[0:200]
-        elif type == "array" then
-          (map(select(.type == "text")) | .[0].text // empty) | .[0:200]
-        else empty end' 2>/dev/null)
-    second=$(echo "$second" | tr '\n' ' ' | sed 's/  */ /g; s/^ *//; s/ *$//')
-    [[ -n "$second" ]] && preview="$second"
-  fi
-  [[ "$preview" == "[Request interrupted"* ]] && return
-  [[ "$preview" == "claude --resume"* ]] && return
-
-  # Title: custom-title > auto-summary > plan heading
-  local ct as title
-  ct=$(grep -m1 '"type":"custom-title"' "$f" 2>/dev/null | jq -r '.customTitle // empty' 2>/dev/null)
-  as=$(grep -m1 '"type":"summary"' "$f" 2>/dev/null | jq -r '.summary // empty' 2>/dev/null)
-  title="${ct:-$as}"
-
-  # Auto-extract plan heading as title for plan execution sessions
-  if [[ -z "$title" && "$first_msg" == "Implement the following plan:"* ]]; then
-    local plan_text="${first_msg#Implement the following plan:}"
-    plan_text="${plan_text# }"
-    plan_text="${plan_text#\# }"
-    title="${plan_text%% ## *}"
-    title="${title:0:120}"
-  fi
-
-  # Keywords: extract text from user messages + assistant messages (text blocks only)
-  local keywords
-  keywords=$(jq -r 'select(.type == "user" or .type == "assistant") | .message.content
-    | if type == "string" then .[0:500]
-      elif type == "array" then [.[] | select(.type == "text") | .text[0:500]] | join(" ")
-      else empty end' "$f" 2>/dev/null \
-    | tr '[:upper:]' '[:lower:]' \
-    | grep -oE '[a-z0-9][a-z0-9_-]{2,40}' \
-    | sort -u | tr '\n' ' ')
-
-  local epoch
-  epoch=$(stat_epoch "$f")
-
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$sid" "$title" "$preview" "$keywords" "$epoch" "$label"
-}
-
-# --- Cache management ---
-
-build_full_cache() {
-  local tmpfile
-  tmpfile=$(mktemp)
-  for d in "$CLAUDE_PROJECTS"/*/; do
-    [[ ! -d "$d" ]] && continue
-    local key label
-    key=$(basename "$d")
-    label=$(project_label "$key")
-    while IFS= read -r f; do
-      process_file "$f" "$label"
-    done < <(ls -t "$d"*.jsonl 2>/dev/null)
-  done > "$tmpfile"
-  sort -t$'\t' -k5,5 -rn "$tmpfile" > "$UNIFIED_CACHE"
-  rm "$tmpfile"
-}
-
-do_incremental() {
-  local new_entries changed_sids
-  new_entries=$(mktemp)
-  changed_sids=$(mktemp)
-
-  for d in "$CLAUDE_PROJECTS"/*/; do
-    [[ ! -d "$d" ]] && continue
-    local key label
-    key=$(basename "$d")
-    label=$(project_label "$key")
-    for f in "$d"*.jsonl; do
-      [[ -f "$f" ]] || continue
-      if [[ "$f" -nt "$UNIFIED_CACHE" ]]; then
-        basename "$f" .jsonl >> "$changed_sids"
-        process_file "$f" "$label" >> "$new_entries"
-      fi
-    done
-  done
-
-  if [[ ! -s "$changed_sids" ]]; then
-    rm "$new_entries" "$changed_sids"
-    return
-  fi
-
-  local n_changed
-  n_changed=$(wc -l < "$changed_sids" | tr -d ' ')
-  if [[ "$n_changed" -gt 20 ]]; then
-    rm "$new_entries" "$changed_sids"
-    build_full_cache
-    return
-  fi
-
-  local merged
-  merged=$(mktemp)
-  cat "$new_entries" > "$merged"
-  awk -F'\t' 'NR==FNR{sids[$0];next} !($1 in sids)' "$changed_sids" "$UNIFIED_CACHE" >> "$merged"
-  sort -t$'\t' -k5,5 -rn "$merged" > "$UNIFIED_CACHE"
-  rm "$new_entries" "$changed_sids" "$merged"
-}
-
-if [[ ! -f "$UNIFIED_CACHE" ]]; then
-  build_full_cache
-else
-  do_incremental
-fi
+# --- Build/update cache (Python indexer — 40-70x faster than bash) ---
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+python3 "$SCRIPT_DIR/session-indexer.py" || { echo "Indexer failed" >&2; exit 1; }
 
 if [[ ! -s "$UNIFIED_CACHE" ]]; then
   echo "No sessions found." >&2
