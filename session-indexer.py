@@ -2,14 +2,17 @@
 """Fast session indexer for claude-sessions.
 
 Replaces bash process_file/build_full_cache/do_incremental.
-Key optimizations vs bash (27s → ~350ms):
+Key design choices:
   1. Single process — eliminates ~4,500 subprocess spawns
   2. Single-pass regex — one scan per file instead of separate grep/find passes
-  3. Capped keyword parsing — JSON-parses first 50 messages, not every message
-  4. Parallel processing with fork (fast worker startup)
+  3. Smart extraction — all user text + assistant "gems" (first/last text blocks)
+  4. TF-IDF keyword ordering — distinctive keywords rank above generic ones
+  5. Parallel processing with fork (fast worker startup)
 """
 
-import json, multiprocessing, os, re, sys, time, warnings
+import json, math, multiprocessing, os, re, sys, time, warnings
+from datetime import datetime, timezone
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 
 PROJECTS_DIR = os.path.join(os.path.expanduser("~"), ".claude", "projects")
@@ -22,11 +25,15 @@ TOKEN_RE = re.compile(r'[a-z0-9][a-z0-9_-]{2,40}')
 # finditer scans the file once, yielding matches in order.
 MARKER_RE = re.compile(rb'"type":"(user|assistant|summary|custom-title)"')
 
-# For focused title search after main scan exits early
-TITLE_RE = re.compile(rb'"type":"(summary|custom-title)"')
-
-# Max messages to JSON-parse for keyword extraction per file.
-KW_MSG_CAP = 50
+# Stopwords to exclude from keyword index (matches the bash query filter)
+STOP_WORDS = frozenset(
+    'the and are not was for that this with from but have has had been '
+    'will would could should into your they them their what when where '
+    'which does also just than then each only very here there some other '
+    'about more over such you all now let can may must got get gets '
+    'its who how why yet nor were did done being having shall might '
+    'both every most these those'.split()
+)
 
 NOISE_PREFIXES = (
     "<local-command-caveat>",
@@ -89,12 +96,45 @@ def _parse_msg_text(line):
     return _extract_text(msg.get("content", ""))
 
 
-def _index_one(args):
-    """Process one session file. Returns (mtime, cache_line) or None.
+def _extract_gems(line):
+    """Extract keyword-rich text from an assistant message.
 
-    Single-pass regex scan finds user, assistant, summary, and custom-title
-    markers in one forward pass. Exits early once keyword budget is exhausted,
-    then does a focused search for title if needed.
+    Claude's responses follow: opening remark → tool calls → closing summary.
+    The first and last text blocks carry the signal; tool_use blocks and
+    intermediate status updates are noise for keyword purposes.
+    """
+    try:
+        obj = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    msg = obj.get("message")
+    if not msg:
+        return None
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        return content[:300]
+    if isinstance(content, list):
+        text_blocks = []
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                t = b.get("text", "")
+                if t and len(t) > 2:
+                    text_blocks.append(t)
+        if not text_blocks:
+            return None
+        if len(text_blocks) == 1:
+            return text_blocks[0][:300]
+        # First (acknowledgment) + last (recap) = the gems
+        return text_blocks[0][:200] + " " + text_blocks[-1][:200]
+    return None
+
+
+def _extract_one(args):
+    """Extract session data. Returns (mtime, sid, title, preview, kw_counter, epoch, label) or None.
+
+    Full-scan: extracts keywords from ALL user messages and assistant
+    "gems" (first + last text blocks per response). Returns raw Counter
+    for TF-IDF scoring in a later pass.
     """
     path, sid, size, mtime, label = args
 
@@ -104,47 +144,49 @@ def _index_one(args):
     except OSError:
         return None
 
-    # Quick check: any user messages at all?
     if b'"type":"user"' not in data:
         return None
 
     first_user = second_user = custom_title = summary = None
     user_count = 0
-    kw_chunks = []
-    kw_budget = KW_MSG_CAP
-    scan_end_pos = 0
+    kw_counter = Counter()
 
-    # Single-pass: find all relevant markers in one forward scan
     for m in MARKER_RE.finditer(data):
         tp = m.group(1)
 
         if tp == b'user':
             user_count += 1
-            if user_count <= 2 or kw_budget > 0:
-                line = _extract_line(data, m.start())
-                text = _parse_msg_text(line)
-                if user_count == 1:
-                    if not text:
-                        return None
-                    first_user = ' '.join(text[:200].split())
-                elif user_count == 2 and text:
-                    second_user = ' '.join(text[:200].split())
-                if text and kw_budget > 0:
-                    kw_chunks.append(text.lower())
-                    kw_budget -= 1
+            line = _extract_line(data, m.start())
+            text = _parse_msg_text(line)
+            if user_count == 1:
+                if not text:
+                    return None
+                first_user = ' '.join(text[:200].split())
+            elif user_count == 2 and text:
+                second_user = ' '.join(text[:200].split())
+            # Index ALL user messages — short and high-signal
+            if text:
+                kw_counter.update(t for t in TOKEN_RE.findall(text.lower()) if t not in STOP_WORDS)
 
         elif tp == b'assistant':
-            if kw_budget > 0:
-                line = _extract_line(data, m.start())
-                text = _parse_msg_text(line)
-                if text:
-                    kw_chunks.append(text.lower())
-                    kw_budget -= 1
+            line = _extract_line(data, m.start())
+            # Skip assistant messages with no text (pure tool calls)
+            if b'"type":"text"' not in line:
+                continue
+            gems = _extract_gems(line)
+            if gems:
+                kw_counter.update(t for t in TOKEN_RE.findall(gems.lower()) if t not in STOP_WORDS)
 
-        elif tp == b'summary' and summary is None:
+        elif tp == b'summary':
             line = _extract_line(data, m.start())
             try:
-                summary = json.loads(line).get("summary") or ""
+                obj = json.loads(line)
+                s = obj.get("summary") or ""
+                if summary is None:
+                    summary = s
+                # Keywords from summaries cover compacted content
+                if s:
+                    kw_counter.update(t for t in TOKEN_RE.findall(s.lower()[:500]) if t not in STOP_WORDS)
             except (json.JSONDecodeError, ValueError):
                 pass
 
@@ -152,28 +194,6 @@ def _index_one(args):
             line = _extract_line(data, m.start())
             try:
                 custom_title = json.loads(line).get("customTitle") or ""
-            except (json.JSONDecodeError, ValueError):
-                pass
-
-        # Exit early when we have enough keywords AND title metadata
-        if user_count >= 2 and kw_budget <= 0:
-            if summary is not None or custom_title is not None:
-                break
-            # Save position for focused title search below
-            scan_end_pos = m.end()
-            break
-
-    # If main scan exited early without finding title, do a focused search
-    if summary is None and custom_title is None and scan_end_pos > 0:
-        tm = TITLE_RE.search(data, scan_end_pos)
-        if tm:
-            line = _extract_line(data, tm.start())
-            try:
-                obj = json.loads(line)
-                if tm.group(1) == b'summary':
-                    summary = obj.get("summary") or ""
-                else:
-                    custom_title = obj.get("customTitle") or ""
             except (json.JSONDecodeError, ValueError):
                 pass
 
@@ -199,16 +219,41 @@ def _index_one(args):
         plan = first_user[len("Implement the following plan:"):].strip().lstrip("# ")
         title = plan.split(" ## ")[0][:120]
 
-    # Keywords
-    kw_text = " ".join(kw_chunks)
-    keywords = " ".join(sorted(set(TOKEN_RE.findall(kw_text))))
-
     # Sanitize for TSV
     title = title.replace('\t', ' ').replace('\n', ' ')
     preview = preview.replace('\t', ' ').replace('\n', ' ')
-    epoch = int(mtime)
 
-    return (mtime, f"{sid}\t{title}\t{preview}\t{keywords}\t{epoch}\t{label}")
+    # Extract creation timestamp from first line (for display date)
+    # Use mtime for ranking (recency = last activity)
+    created_epoch = int(mtime)  # fallback
+    first_nl = data.find(b'\n')
+    first_line = data[:first_nl] if first_nl > 0 else data
+    ts_match = re.search(rb'"timestamp":"([^"]+)"', first_line)
+    if ts_match:
+        try:
+            dt = datetime.fromisoformat(ts_match.group(1).decode().replace('Z', '+00:00'))
+            created_epoch = int(dt.timestamp())
+        except (ValueError, OSError):
+            pass
+
+    return (mtime, sid, title, preview, kw_counter, created_epoch, int(mtime), label)
+
+
+def _tfidf_sort(kw_counter, df, n_docs):
+    """Sort keywords by TF-IDF score descending, alphabetical tiebreak."""
+    scores = {}
+    for kw, tf in kw_counter.items():
+        idf = math.log(n_docs / max(df.get(kw, 0), 1))
+        scores[kw] = tf * idf
+    return sorted(scores, key=lambda k: (-scores[k], k))
+
+
+def _format_entry(session_data, df, n_docs):
+    """Format a session's extracted data into a cache line with TF-IDF keyword ordering."""
+    mtime, sid, title, preview, kw_counter, created_epoch, mtime_epoch, label = session_data
+    kw_sorted = _tfidf_sort(kw_counter, df, n_docs)
+    keywords = " ".join(kw_sorted)
+    return (mtime, f"{sid}\t{title}\t{preview}\t{keywords}\t{created_epoch}\t{mtime_epoch}\t{label}")
 
 
 def scan_all_files():
@@ -242,20 +287,28 @@ def _get_pool_context():
 
 
 def build_full(files):
-    """Full cache rebuild with parallel processing."""
+    """Full cache rebuild: parallel extraction → TF-IDF scoring → cache."""
     n_workers = min(os.cpu_count() or 4, 8, max(len(files), 1))
 
     if len(files) < 20:
-        results = [_index_one(f) for f in files]
+        raw = [_extract_one(f) for f in files]
     else:
-        # Sort largest files first for better load balancing
         files_sorted = sorted(files, key=lambda f: f[2], reverse=True)
         chunksize = max(1, len(files_sorted) // (n_workers * 4))
         ctx = _get_pool_context()
         with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as pool:
-            results = list(pool.map(_index_one, files_sorted, chunksize=chunksize))
+            raw = list(pool.map(_extract_one, files_sorted, chunksize=chunksize))
 
-    entries = [r for r in results if r]
+    valid = [r for r in raw if r]
+
+    # Compute document frequencies across all sessions
+    n_docs = len(valid)
+    df = Counter()
+    for _, _, _, _, kw_counter, _, _, _ in valid:
+        df.update(kw_counter.keys())  # +1 per keyword per session (not per occurrence)
+
+    # Format cache lines with TF-IDF keyword ordering
+    entries = [_format_entry(r, df, n_docs) for r in valid]
     entries.sort(key=lambda x: x[0], reverse=True)
     return [e[1] for e in entries]
 
@@ -272,29 +325,42 @@ def incremental(files):
     if len(changed) > 20:
         return build_full(files)
 
-    # Process changed files sequentially (few files, not worth pool overhead)
-    changed_sids = set()
-    new_entries = []
-    for f in changed:
-        changed_sids.add(f[1])
-        result = _index_one(f)
-        if result:
-            new_entries.append(result)
-
-    # Merge with existing cache (exclude changed sids)
+    # Approximate DF from existing cache (for TF-IDF scoring of changed sessions)
+    df = Counter()
+    existing = []
     with open(CACHE_PATH, 'r') as fh:
         for line in fh:
             line = line.rstrip('\n')
             if not line:
                 continue
-            sid = line.split('\t', 1)[0]
-            if sid not in changed_sids:
-                parts = line.split('\t')
-                try:
-                    epoch = float(parts[4]) if len(parts) > 4 else 0
-                except (ValueError, IndexError):
-                    epoch = 0
-                new_entries.append((epoch, line))
+            parts = line.split('\t')
+            # Detect old 6-field format → full rebuild
+            if len(parts) < 7:
+                return build_full(files)
+            sid = parts[0]
+            if len(parts) > 3:
+                df.update(parts[3].split())  # approximate: DF=1 per keyword per session
+            try:
+                mtime_epoch = float(parts[5])  # mtime_epoch is field 5 (0-indexed)
+            except (ValueError, IndexError):
+                mtime_epoch = 0
+            existing.append((sid, mtime_epoch, line))
+
+    n_docs = len(existing) + len(changed)
+
+    # Process changed files
+    changed_sids = set()
+    new_entries = []
+    for f in changed:
+        changed_sids.add(f[1])
+        result = _extract_one(f)
+        if result:
+            new_entries.append(_format_entry(result, df, n_docs))
+
+    # Merge with existing cache (exclude changed sids)
+    for sid, epoch, line in existing:
+        if sid not in changed_sids:
+            new_entries.append((epoch, line))
 
     new_entries.sort(key=lambda x: x[0], reverse=True)
     return [e[1] for e in new_entries]

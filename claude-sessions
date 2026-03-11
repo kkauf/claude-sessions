@@ -34,7 +34,7 @@ current_label() {
 }
 
 # --- Build/update cache (Python indexer — 40-70x faster than bash) ---
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}")")" && pwd)"
 python3 "$SCRIPT_DIR/session-indexer.py" || { echo "Indexer failed" >&2; exit 1; }
 
 if [[ ! -s "$UNIFIED_CACHE" ]]; then
@@ -51,21 +51,24 @@ CL=$(current_label)
 #
 # Architecture: 2-field fzf input
 #   F1: session_id     (hidden via --with-nth=2)
-#   F2: display + 300 spaces padding + search keywords
+#   F2: display + 300 spaces padding + search keywords (TF-IDF ordered)
 #
 # --with-nth=2 hides F1 (SID) and shows only F2.
 # The 300-space padding pushes keywords off-screen, but fzf still searches them.
 # --no-hscroll prevents fzf from scrolling to show off-screen keyword matches.
-# --tiebreak=begin,index ranks title/preview matches above keyword-only matches.
+# --tiebreak=index ranks by recency (mtime order from cache).
+# Search text order: title > topic boost > keywords > preview > project.
+# Cache fields: SID, title, preview, keywords, created_epoch, mtime_epoch, project.
+# Display uses created_epoch (when session started). Cache sorted by mtime (last activity).
 #
 # Preview uses bash -c explicitly (fzf defaults to $SHELL which may be zsh).
 
 PAD=$(printf '%300s' '')
 
-selected=$(awk -F'\t' -v cl="$CL" -v now="$(date +%s)" -v pad="$PAD" -v home_key="$HOME_KEY" '
+selected=$(awk -F'\t' -v cl="$CL" -v mid="$(date -j -v0H -v0M -v0S +%s 2>/dev/null || date -d 'today 0' +%s)" -v pad="$PAD" -v home_key="$HOME_KEY" '
 function reldate(ep,    d) {
-  d = int((now - ep) / 86400)
-  if (d == 0) return "today"
+  if (ep >= mid) return "today"
+  d = int((mid - ep - 1) / 86400) + 1
   if (d == 1) return " 1d  "
   if (d < 7) return sprintf("%2dd  ", d)
   if (d < 30) return sprintf("%2dw  ", int(d/7))
@@ -73,9 +76,9 @@ function reldate(ep,    d) {
   return sprintf("%2dy  ", int(d/365))
 }
 {
-  sid=$1; title=$2; preview=$3; kw=$4; epoch=$5; proj=$6
+  sid=$1; title=$2; preview=$3; kw=$4; created=$5; proj=$7
 
-  rd = reldate(epoch)
+  rd = reldate(created)
 
   # Project tag (only for other projects)
   tag = ""
@@ -90,8 +93,13 @@ function reldate(ep,    d) {
     line = sprintf("\033[33m%-5s\033[0m %s%s", rd, p, tag)
   }
 
-  # Append padding + search text (off-screen, but fzf still searches it)
-  search = title " " preview " " kw " " proj
+  # Search text: title > topic boost > keywords > preview > project
+  # Keywords before preview so topical TF-IDF matches rank above
+  # incidental preview-text matches.
+  n = split(kw, kw_arr, " ")
+  topic = ""
+  for (i = 1; i <= 15 && i <= n; i++) topic = topic " " kw_arr[i]
+  search = title " " topic " " kw " " preview " " proj
   printf "%s\t%s%s%s\n", sid, line, pad, search
 }' "$UNIFIED_CACHE" | fzf \
   --ansi \
@@ -100,7 +108,7 @@ function reldate(ep,    d) {
   --exact \
   -i \
   --no-hscroll \
-  --tiebreak=begin,index \
+  --tiebreak=index \
   --header="$session_count sessions · ctrl-/ toggle preview" \
   --bind="ctrl-/:toggle-preview" \
   --query="$(echo "${1:-}" | tr -d '.,;:!?()\"' | tr "'" " " | tr '[:upper:]' '[:lower:]' | tr -s ' ' '\n' | grep -xvE '(.{0,2}|the|and|are|not|was|for|that|this|with|from|but|have|has|had|been|will|would|could|should|into|your|they|them|their|what|when|where|which|does|also|just|than|then|each|only|very|here|there|some|other|about|more|over|such)' | sort -u | tr '\n' ' ')" \
@@ -114,6 +122,7 @@ function reldate(ep,    d) {
     shopt -s nullglob
     sid="$1"
     home_key="$2"
+    query="$3"
     files=("$HOME/.claude/projects"/*/${sid}.jsonl)
     f="${files[0]}"
     if [[ -n "$f" && -f "$f" ]]; then
@@ -122,24 +131,39 @@ function reldate(ep,    d) {
       d="${d##*CloudDocs-Documents-}"; d="${d##*Documents-}"
       echo -e "\033[2m$d\033[0m"
       echo ""
-      # Warn about compacted sessions
-      compact_n=$(grep -c "\"compact_boundary\"" "$f" 2>/dev/null || echo 0)
+      compact_n=$(grep -c "\"compact_boundary\"" "$f" 2>/dev/null) || compact_n=0
       if [[ "$compact_n" -gt 0 ]]; then
         echo -e "\033[33m⚠ ${compact_n}x compacted — long session\033[0m"
         echo ""
       fi
-      grep "\"type\":\"user\"" "$f" 2>/dev/null | head -12 | jq -r "
-        .message.content
-        | if type == \"string\" then .[0:500]
-          elif type == \"array\" then
-            [.[] | select(.type == \"text\") | .text] | join(\" \") | .[0:500]
-          else empty end" 2>/dev/null | while IFS= read -r line; do
-        [[ -n "$line" ]] && echo -e "\033[36m>\033[0m $line" && echo
-      done
+      if [[ -n "$query" ]]; then
+        pat=$(echo "$query" | tr " " "\n" | grep -v "^$" | paste -sd "|" -)
+        if [[ -n "$pat" ]]; then
+          grep -E "\"type\":\"(user|assistant)\"" "$f" 2>/dev/null | \
+            grep -iE "$pat" | head -20 | \
+            jq -r "
+              .message.content
+              | if type == \"string\" then .[0:500]
+                elif type == \"array\" then
+                  [.[] | select(.type == \"text\") | .text] | join(\" \") | .[0:500]
+                else empty end" 2>/dev/null | while IFS= read -r line; do
+            [[ -n "$line" ]] && echo -e "\033[36m>\033[0m $line" && echo
+          done
+        fi
+      else
+        grep "\"type\":\"user\"" "$f" 2>/dev/null | head -12 | jq -r "
+          .message.content
+          | if type == \"string\" then .[0:500]
+            elif type == \"array\" then
+              [.[] | select(.type == \"text\") | .text] | join(\" \") | .[0:500]
+            else empty end" 2>/dev/null | while IFS= read -r line; do
+          [[ -n "$line" ]] && echo -e "\033[36m>\033[0m $line" && echo
+        done
+      fi
     else
       echo "Session file not found"
     fi
-  '\'' _ {1} '"$HOME_KEY" \
+  '\'' _ {1} '"$HOME_KEY"' {q}' \
   --preview-window=right:40%:wrap)
 
 if [[ -n "$selected" ]]; then
