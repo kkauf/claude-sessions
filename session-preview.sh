@@ -7,7 +7,9 @@ sid="$1"
 home_key="$2"
 query="$3"
 
-files=("$HOME/.claude/projects"/*/${sid}.jsonl)
+# Support override for testing
+projects_dir="${SESSION_PROJECTS_DIR:-$HOME/.claude/projects}"
+files=("$projects_dir"/*/${sid}.jsonl)
 f="${files[0]}"
 
 if [[ -z "$f" || ! -f "$f" ]]; then
@@ -15,11 +17,39 @@ if [[ -z "$f" || ! -f "$f" ]]; then
   exit 0
 fi
 
-# Project name header
+# --- Metadata header ---
 d=$(basename "$(dirname "$f")")
 d="${d#-${home_key}-}"; d="${d#github-}"
 d="${d##*CloudDocs-Documents-}"; d="${d##*Documents-}"
-echo -e "\033[2m$d\033[0m"
+
+# Message count (user + assistant, single pass)
+msg_count=$(grep -cE '"type":"(user|assistant)"' "$f" 2>/dev/null) || msg_count=0
+
+# Created date from first line timestamp
+created_str=""
+first_ts=$(head -1 "$f" | grep -oE '"timestamp":"[^"]+"' | head -1 | cut -d'"' -f4)
+if [[ -n "$first_ts" ]]; then
+  # Parse ISO timestamp to readable date
+  if [[ "$(uname)" == "Darwin" ]]; then
+    # macOS: convert ISO to epoch then format
+    epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${first_ts%%.*}" +%s 2>/dev/null) || epoch=""
+    if [[ -n "$epoch" ]]; then
+      today_start=$(date -j -v0H -v0M -v0S +%s 2>/dev/null)
+      if [[ "$epoch" -ge "$today_start" ]]; then
+        created_str="today"
+      else
+        created_str=$(date -j -r "$epoch" "+%b %d, %Y" 2>/dev/null)
+      fi
+    fi
+  else
+    created_str=$(date -d "${first_ts}" "+%b %d, %Y" 2>/dev/null) || created_str=""
+  fi
+fi
+
+# Header line: project · branch (if available)
+echo -e "\033[2m─── $d ─────────────────────\033[0m"
+[[ -n "$created_str" ]] && echo -e "\033[2mCreated: $created_str\033[0m"
+echo -e "\033[2mMessages: $msg_count\033[0m"
 echo ""
 
 # Compaction warning

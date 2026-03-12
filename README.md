@@ -4,12 +4,13 @@ Fast session picker for [Claude Code](https://docs.anthropic.com/en/docs/claude-
 
 ## Features
 
-- **Cross-project search** — find sessions from any project, not just the current one
+- **Relevance-ranked search** — when you search with arguments, Python scores results using field-weighted TF-IDF: title matches (10x) beat preview matches (8x) beat keyword matches (1x). Recency is a tiebreaker, not the primary signal.
+- **Interactive browse** — no arguments opens all sessions sorted by recency with fzf's interactive search
 - **TF-IDF keyword ranking** — distinctive terms (e.g., "outreach", "webhook") rank above generic ones (e.g., "feature", "update")
 - **Smart extraction** — indexes all user messages + assistant "gems" (opening remarks and closing recaps), skips tool call noise
-- **Query-matched preview** — right panel shows messages containing your search terms, with user (▸) and assistant (▹) distinguished
-- **Recency-first** — recently active sessions rank higher; date shows when session was created
-- **Incremental caching** — instant startup after first run (~0.3s warm, ~1.3s cold for 370 sessions)
+- **Query-matched preview** — right panel shows messages containing your search terms, with user (▸) and assistant (▹) distinguished. Metadata header shows project, creation date, and message count.
+- **Advanced query syntax** — exact phrases (`"auth bug"`), project filter (`--project kh`), negation (`--exclude standup` or `-standup`)
+- **Incremental caching** — instant startup after first run (~0.3s warm, ~1.3s cold for 370 sessions). Search scoring reads from cache in ~60ms.
 - **Cross-project tags** — sessions from other projects show a dim project label
 - **Relative dates** — "today", "1d", "2w", "3mo"
 
@@ -40,16 +41,22 @@ The indexer (`session-indexer.py`) must be in the same directory as the main scr
 ## Usage
 
 ```bash
-# Browse all sessions
+# Browse all sessions (recency order, interactive search)
 claude-sessions
 
-# Pre-filter search
-claude-sessions booking
+# Relevance-ranked search (Python scores, fzf displays)
 claude-sessions "auth bug"
+claude-sessions roadmap notion database
+
+# Advanced queries
+claude-sessions '"cold email outreach"'    # exact phrase
+claude-sessions "email --project kh"       # project filter
+claude-sessions "email --exclude standup"  # negation
+claude-sessions "email -standup"           # shorthand negation
 ```
 
 **Controls:**
-- Type to search (exact substring match)
+- Type to narrow results (within ranked results when searching, full interactive when browsing)
 - Arrow keys to navigate
 - `Enter` to resume the selected session
 - `ctrl-/` to toggle the preview panel
@@ -67,6 +74,19 @@ Claude Code stores session data as `.jsonl` files in `~/.claude/projects/`. This
 
 ### Search architecture
 
+Two modes depending on whether a query is provided:
+
+**With query** (`claude-sessions "auth bug"`): Python reads the cached TSV, scores each session with field-weighted TF-IDF, and pipes pre-ranked results to fzf with `--no-sort`. fzf is display + selection only — you can type to narrow within the ranked results.
+
+```
+Score = Σ(query_terms) IDF(term) × (10·title + 8·preview + 1·keywords)
+      + phrase_proximity_bonus
+      + exact_phrase_bonus
+      + 0.1 × recency_normalized
+```
+
+**Without query** (`claude-sessions`): All sessions display in recency order. fzf handles interactive search with `--tiebreak=index`.
+
 ```
 ┌─ fzf input (2-field TSV) ──────────────────────────────────┐
 │ F1: session_id (hidden)                                     │
@@ -75,9 +95,6 @@ Claude Code stores session data as `.jsonl` files in `~/.claude/projects/`. This
 │                                        pushes keywords       │
 │                                        off-screen            │
 └─────────────────────────────────────────────────────────────┘
-
-Search text order: title → top 15 TF-IDF keywords → all keywords → preview → project
-Tiebreak: index (= recency, since cache is sorted by mtime)
 ```
 
 ### Preview
@@ -194,7 +211,7 @@ Then type `/sessions auth bug` inside Claude Code to launch the picker with a pr
 bash test-session-tools.sh
 ```
 
-32 tests covering the indexer (TF-IDF, stopwords, timestamps, project labels) and preview (query matching, tool_use exclusion, compacted sessions).
+47 tests covering the indexer, search scoring (field weighting, IDF, exact phrases, negation, project filter), and preview (query matching, tool_use exclusion, compacted sessions, metadata header).
 
 ## Session data format
 
@@ -216,7 +233,7 @@ Issues and PRs welcome.
 
 - [ ] Configurable keybindings
 - [ ] Delete/archive sessions from the picker
-- [ ] Session statistics (message count, duration)
+- [x] Session statistics (message count in preview header)
 - [ ] Export sessions
 - [ ] Better Linux testing
 - [ ] Terminal.app / Alacritty / Warp Raycast script variants

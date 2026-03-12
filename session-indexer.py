@@ -368,9 +368,187 @@ def incremental(files):
     return [e[1] for e in new_entries]
 
 
+def _tokenize(text):
+    """Tokenize text into a set of lowercase tokens, excluding stopwords."""
+    return set(t for t in TOKEN_RE.findall(text.lower()) if t not in STOP_WORDS)
+
+
+def _phrase_proximity(terms, text, weight=5.0):
+    """Bonus when query terms appear as a contiguous phrase in text."""
+    if len(terms) < 2:
+        return 0.0
+    phrase = " ".join(terms)
+    text_lower = text.lower()
+    # Exact phrase substring match
+    if phrase in text_lower:
+        return weight * len(terms)
+    # Adjacent pairs bonus (partial phrase match)
+    bonus = 0.0
+    for i in range(len(terms) - 1):
+        pair = terms[i] + " " + terms[i + 1]
+        if pair in text_lower:
+            bonus += weight * 0.5
+    return bonus
+
+
+def search(query, cache_path=None):
+    """Score and rank sessions by relevance to query terms.
+
+    Reads the cached TSV and applies TF-IDF weighted field scoring.
+    Returns TSV lines sorted by score (same 7-field format).
+    """
+    cache_path = cache_path or CACHE_PATH
+    if not os.path.isfile(cache_path):
+        return []
+
+    # Parse query: extract exact phrases, negation terms, project filter
+    raw_query = query
+    exact_phrases = re.findall(r'"([^"]+)"', raw_query)
+    # Remove exact phrases from query for term extraction
+    for p in exact_phrases:
+        raw_query = raw_query.replace(f'"{p}"', '')
+
+    project_filter = None
+    project_match = re.search(r'--project\s+(\S+)', raw_query)
+    if project_match:
+        project_filter = project_match.group(1).lower()
+        raw_query = raw_query[:project_match.start()] + raw_query[project_match.end():]
+
+    exclude_match = re.search(r'--exclude\s+(\S+)', raw_query)
+    negation_terms = set()
+    if exclude_match:
+        negation_terms = _tokenize(exclude_match.group(1))
+        raw_query = raw_query[:exclude_match.start()] + raw_query[exclude_match.end():]
+
+    # Also handle -term syntax for negation
+    neg_pattern = re.findall(r'(?:^|\s)-(\w+)', raw_query)
+    for t in neg_pattern:
+        negation_terms.add(t.lower())
+        raw_query = re.sub(r'(?:^|\s)-' + re.escape(t), '', raw_query)
+
+    query_terms = [t for t in TOKEN_RE.findall(raw_query.lower()) if t not in STOP_WORDS]
+    if not query_terms and not exact_phrases:
+        return []
+
+    # Read cache
+    sessions = []
+    with open(cache_path, 'r') as fh:
+        for line in fh:
+            line = line.rstrip('\n')
+            if not line:
+                continue
+            parts = line.split('\t')
+            if len(parts) < 7:
+                continue
+            sessions.append({
+                'sid': parts[0],
+                'title': parts[1],
+                'preview': parts[2],
+                'keywords': parts[3],
+                'created': parts[4],
+                'mtime': parts[5],
+                'project': parts[6],
+                'line': line,
+            })
+
+    if not sessions:
+        return []
+
+    # Tokenize each session's fields
+    for s in sessions:
+        s['title_tokens'] = _tokenize(s['title'])
+        s['preview_tokens'] = _tokenize(s['preview'])
+        s['keyword_set'] = set(s['keywords'].split()) - STOP_WORDS
+
+    # Compute IDF for query terms across all sessions
+    n_docs = len(sessions)
+    idf = {}
+    for term in query_terms:
+        doc_count = sum(1 for s in sessions if (
+            term in s['title_tokens'] or
+            term in s['preview_tokens'] or
+            term in s['keyword_set']
+        ))
+        idf[term] = math.log(n_docs / max(doc_count, 1))
+
+    # Recency normalization: most recent mtime = 1.0, oldest = 0.0
+    mtimes = [float(s['mtime']) for s in sessions]
+    max_mtime = max(mtimes) if mtimes else 1
+    min_mtime = min(mtimes) if mtimes else 0
+    mtime_range = max_mtime - min_mtime if max_mtime > min_mtime else 1.0
+
+    # Score each session
+    scored = []
+    for s in sessions:
+        # Project filter
+        if project_filter and project_filter not in s['project'].lower():
+            continue
+
+        title_lower = s['title'].lower()
+        preview_lower = s['preview'].lower()
+        combined_text = title_lower + " " + preview_lower
+
+        # Negation filter: exclude if any negated term appears in title or preview
+        if negation_terms and any(t in s['title_tokens'] or t in s['preview_tokens'] for t in negation_terms):
+            continue
+
+        # Field-weighted TF-IDF scoring
+        score = 0.0
+        for term in query_terms:
+            term_idf = idf.get(term, 0)
+            field_score = (
+                10.0 * (term in s['title_tokens']) +
+                 8.0 * (term in s['preview_tokens']) +
+                 1.0 * (term in s['keyword_set'])
+            )
+            score += term_idf * field_score
+
+        # Phrase proximity bonus
+        score += _phrase_proximity(query_terms, s['title'] + " " + s['preview'])
+
+        # Exact phrase bonus (massive)
+        for phrase in exact_phrases:
+            phrase_lower = phrase.lower()
+            if phrase_lower in title_lower:
+                score += 50.0
+            elif phrase_lower in preview_lower:
+                score += 30.0
+            elif phrase_lower in s['keywords'].lower():
+                score += 10.0
+
+        # Recency tiebreaker
+        recency = (float(s['mtime']) - min_mtime) / mtime_range
+        score += 0.1 * recency
+
+        if score > 0:
+            scored.append((score, s['line']))
+
+    # Sort by score descending
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [line for _, line in scored]
+
+
 def main():
     t0 = time.monotonic()
     timing = "--timing" in sys.argv
+
+    # --search mode: score and rank cached sessions
+    search_idx = None
+    for i, arg in enumerate(sys.argv):
+        if arg == "--search":
+            search_idx = i
+            break
+
+    if search_idx is not None:
+        query = sys.argv[search_idx + 1] if search_idx + 1 < len(sys.argv) else ""
+        cache = os.environ.get("SESSION_CACHE_PATH", CACHE_PATH)
+        results = search(query, cache)
+        for line in results:
+            print(line)
+        elapsed = (time.monotonic() - t0) * 1000
+        if timing:
+            print(f"search: {len(results)} results, {elapsed:.0f}ms", file=sys.stderr)
+        sys.exit(0)
 
     if not os.path.isdir(PROJECTS_DIR):
         sys.exit(0)

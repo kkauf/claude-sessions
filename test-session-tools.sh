@@ -219,92 +219,100 @@ assert_not_contains "s001 keywords exclude 'the'" " the " " $s001_kw "
 assert_not_contains "s001 keywords exclude 'and'" " and " " $s001_kw "
 assert_not_contains "s001 keywords exclude 'for'" " for " " $s001_kw "
 
+# --- SEARCH SCORING TESTS ---
+
+echo ""
+echo "=== Search Scoring Tests ==="
+
+# Test: "cold email outreach" should rank session-001 first (title/preview match)
+search_outreach=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" \
+  python3 "$SCRIPT_DIR/session-indexer.py" --search "cold email outreach")
+
+first_result=$(echo "$search_outreach" | head -1 | cut -f1)
+assert_eq "search 'cold email outreach' ranks s001 first" "session-001" "$first_result"
+
+# Test: session with term in title/preview ranks above session with term only in keywords
+# "outreach" appears in s001's preview text and s004's keywords (via "outreach campaign metrics")
+# s001 should rank higher because it has "outreach" prominently in the preview
+search_outreach_only=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" \
+  python3 "$SCRIPT_DIR/session-indexer.py" --search "outreach")
+
+outreach_first=$(echo "$search_outreach_only" | head -1 | cut -f1)
+assert_eq "search 'outreach' ranks s001 first (preview match > keyword)" "session-001" "$outreach_first"
+
+# Test: "click tracking feedback" should return both s001 and s004
+search_click=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" \
+  python3 "$SCRIPT_DIR/session-indexer.py" --search "click tracking feedback")
+assert_contains "search 'click tracking feedback' includes s001" "session-001" "$search_click"
+assert_contains "search 'click tracking feedback' includes s004" "session-004" "$search_click"
+
+# Test: "standup" should return session-003
+search_standup=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" \
+  python3 "$SCRIPT_DIR/session-indexer.py" --search "standup")
+assert_contains "search 'standup' finds s003" "session-003" "$search_standup"
+
+# Test: project filter works
+search_proj=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" \
+  python3 "$SCRIPT_DIR/session-indexer.py" --search "email --project myproject")
+assert_contains "project filter includes s001 (myproject)" "session-001" "$search_proj"
+assert_not_contains "project filter excludes s003 (Personal)" "session-003" "$search_proj"
+
+# Test: negation excludes correctly
+search_neg=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" \
+  python3 "$SCRIPT_DIR/session-indexer.py" --search "email --exclude standup")
+assert_not_contains "negation excludes s003 (has 'standup' in text)" "session-003" "$search_neg"
+
+# Test: empty query returns nothing (no crash)
+search_empty=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" \
+  python3 "$SCRIPT_DIR/session-indexer.py" --search "")
+empty_count=$(echo "$search_empty" | grep -c '.' || true)
+# Empty string has 1 line from echo, but should be blank
+assert_eq "empty query returns no results" "0" "$empty_count"
+
+# Test: IDF weighting — common terms score less than rare terms
+# "email" appears in s001 + s004 (common), "standup" only in s003 (rare)
+# Search for both: the session with the rare term should rank high
+search_idf=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" \
+  python3 "$SCRIPT_DIR/session-indexer.py" --search "standup email")
+idf_first=$(echo "$search_idf" | head -1 | cut -f1)
+# s003 has "standup" (rare, high IDF) in preview; s001/s004 have "email" (common, low IDF)
+# s003 should rank first because "standup" has higher IDF and appears in preview (weight 8)
+assert_eq "IDF: rare term 'standup' boosts s003 above common 'email'" "session-003" "$idf_first"
+
+# Test: exact phrase matching
+search_phrase=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" \
+  python3 "$SCRIPT_DIR/session-indexer.py" --search '"cold email outreach"')
+phrase_first=$(echo "$search_phrase" | head -1 | cut -f1)
+assert_eq "exact phrase '\"cold email outreach\"' ranks s001 first" "session-001" "$phrase_first"
+
+# Test: search result format is valid 7-field TSV
+search_format=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" \
+  python3 "$SCRIPT_DIR/session-indexer.py" --search "email")
+format_fields=$(echo "$search_format" | head -1 | awk -F'\t' '{print NF}')
+assert_eq "search results have 7 TSV fields" "7" "$format_fields"
+
 # --- PREVIEW TESTS ---
 
 echo ""
 echo "=== Preview Tests ==="
 
-# Extract the preview logic into a testable script
-cat > "$TMPDIR/preview.sh" << 'BASH'
-#!/usr/bin/env bash
-# Extracted preview logic from claude-sessions --preview
-# Args: $1=session_id $2=home_key $3=query $4=projects_dir
-shopt -s nullglob
-sid="$1"
-home_key="$2"
-query="$3"
-projects_dir="$4"
-
-files=("$projects_dir"/*/${sid}.jsonl)
-f="${files[0]}"
-if [[ -n "$f" && -f "$f" ]]; then
-  d=$(basename "$(dirname "$f")")
-  d="${d#-${home_key}-}"; d="${d#github-}"
-  d="${d##*CloudDocs-Documents-}"; d="${d##*Documents-}"
-  echo "$d"
-  echo ""
-  compact_n=$(grep -c "\"compact_boundary\"" "$f" 2>/dev/null) || compact_n=0
-  if [[ "$compact_n" -gt 0 ]]; then
-    echo "⚠ ${compact_n}x compacted — long session"
-    echo ""
-  fi
-  jq_text='
-    select(.message.content) |
-    .type as $t |
-    .message.content |
-    (if type == "string" then .
-     elif type == "array" then
-       [.[] | select(.type == "text") | .text] | join(" ")
-     else "" end) |
-    select(length > 0) |
-    if $t == "user" then "[U] " + .[0:300]
-    else "[A] " + .[0:300] end'
-  if [[ -n "$query" ]]; then
-    pat=$(echo "$query" | tr " " "\n" | grep -v "^$" | paste -sd "|" -)
-    if [[ -n "$pat" ]]; then
-      grep -E "\"type\":\"(user|assistant)\"" "$f" 2>/dev/null | \
-        jq -r "$jq_text" 2>/dev/null | \
-        grep -iE "$pat" | head -15 | while IFS= read -r line; do
-        role="${line:0:3}"
-        text="${line:4}"
-        if [[ "$role" == "[U]" ]]; then
-          echo -e "> $text" && echo
-        else
-          echo -e "< $text" && echo
-        fi
-      done
-    fi
-  else
-    grep '"type":"user"' "$f" 2>/dev/null | head -12 | jq -r "$jq_text" 2>/dev/null | \
-      while IFS= read -r line; do
-      text="${line:4}"
-      [[ -n "$text" ]] && echo "> $text" && echo
-    done
-  fi
-else
-  echo "Session file not found"
-fi
-BASH
-chmod +x "$TMPDIR/preview.sh"
+# Use the real session-preview.sh with SESSION_PROJECTS_DIR override
+run_preview() {
+  SESSION_PROJECTS_DIR="$PROJECTS" bash "$SCRIPT_DIR/session-preview.sh" "$@"
+}
 
 # Test: Preview without query shows user messages
-preview_no_query=$(bash "$TMPDIR/preview.sh" "session-001" "Users-test" "" "$PROJECTS" || true)
+preview_no_query=$(run_preview "session-001" "Users-test" "" || true)
 assert_contains "no-query preview shows first user msg" "cold email outreach" "$preview_no_query"
 assert_contains "no-query preview shows second user msg" "click tracking" "$preview_no_query"
 
 # Test: Preview with query "outreach" shows matching messages
-preview_outreach=$(bash "$TMPDIR/preview.sh" "session-001" "Users-test" "outreach" "$PROJECTS" || true)
+preview_outreach=$(run_preview "session-001" "Users-test" "outreach" || true)
 assert_contains "query preview matches 'outreach' in user msg" "cold email outreach" "$preview_outreach"
-# Assistant messages now prefixed with "<" in preview
 assert_contains "query preview matches 'outreach' in assistant text" "outreach feature" "$preview_outreach"
 
 # BUG TEST: Preview with query "matches" on session-003 should NOT show tool_use content
-preview_matches_s003=$(bash "$TMPDIR/preview.sh" "session-003" "Users-test" "matches" "$PROJECTS" || true)
-# Currently BROKEN: grep matches "matches" inside tool_use JSON, jq extracts empty text → blank lines
-# The preview should either show nothing (no text mentions "matches") or only text-containing messages
-
-# Count actual content lines (exclude blank lines and header)
-content_lines=$(echo "$preview_matches_s003" | grep "^>" | grep -v "^$" || true)
+preview_matches_s003=$(run_preview "session-003" "Users-test" "matches" || true)
 
 # The preview should not show tool_use content as results.
 # With the fix (jq extract THEN grep), tool_use-only messages produce no text to match.
@@ -312,11 +320,11 @@ assert_not_contains "s003 preview for 'matches' excludes tool SQL content" "SELE
 assert_not_contains "s003 preview for 'matches' excludes file paths" "matches/profile" "$preview_matches_s003"
 
 # Test: Compacted session shows compaction warning
-preview_compacted=$(bash "$TMPDIR/preview.sh" "session-002" "Users-test" "" "$PROJECTS" || true)
+preview_compacted=$(run_preview "session-002" "Users-test" "" || true)
 assert_contains "compacted session shows warning" "compacted" "$preview_compacted"
 
 # Test: Compacted session with query still shows post-compaction messages
-preview_compacted_q=$(bash "$TMPDIR/preview.sh" "session-002" "Users-test" "profile" "$PROJECTS" || true)
+preview_compacted_q=$(run_preview "session-002" "Users-test" "profile" || true)
 assert_contains "compacted session query shows post-compaction msg" "profile detail modal" "$preview_compacted_q"
 
 # BUG TEST: Query "matches" on session-003 should show project header but no ghost results
@@ -326,20 +334,28 @@ ghost_count=$(echo "$preview_matches_s003" | grep -cE "^[><]" || true)
 assert_eq "s003 no ghost results for tool_use 'matches'" "0" "$ghost_count"
 
 # Test: Preview with multi-word query
-preview_multi=$(bash "$TMPDIR/preview.sh" "session-004" "Users-test" "email feedback" "$PROJECTS" || true)
+preview_multi=$(run_preview "session-004" "Users-test" "email feedback" || true)
 assert_contains "multi-word query matches 'email'" "email" "$preview_multi"
 assert_contains "multi-word query matches 'feedback'" "feedback" "$preview_multi"
 
 # Test: Preview line count — session-001 query "outreach" should return multiple results
-outreach_lines=$(echo "$preview_outreach" | grep -c "^>" || true)
 assert_line_count_ge "outreach query returns multiple preview lines" 2 "$preview_outreach"
 
 # Test: Session not found
-preview_missing=$(bash "$TMPDIR/preview.sh" "session-nonexistent" "Users-test" "" "$PROJECTS" || true)
+preview_missing=$(run_preview "session-nonexistent" "Users-test" "" || true)
 assert_contains "missing session shows error" "not found" "$preview_missing"
 
 # Test: Project name in preview header
 assert_contains "s001 preview header shows project" "myproject" "$preview_no_query"
+
+# Test: Metadata header shows message count
+assert_contains "preview shows message count" "Messages:" "$preview_no_query"
+
+# Test: Metadata header shows creation date
+assert_contains "preview shows created date" "Created:" "$preview_no_query"
+
+# Test: Metadata header shows horizontal rule
+assert_contains "preview shows header rule" "───" "$preview_no_query"
 
 # --- RESULTS ---
 
