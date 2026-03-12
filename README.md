@@ -92,11 +92,39 @@ The cache lives at `~/.claude/.sessions-unified-cache.tsv`. Delete it to force a
 rm ~/.claude/.sessions-unified-cache.tsv
 ```
 
-## Raycast integration
+## Launch methods
 
-You can launch the session picker from [Raycast](https://raycast.com) with an optional search query.
+### Shell alias
 
-Create a Raycast script command (e.g., `~/.raycast-scripts/claude-sessions.sh`):
+```bash
+# Add to ~/.bashrc or ~/.zshrc
+alias cs="claude-sessions"
+
+# With a default search term
+alias cs-auth="claude-sessions auth"
+```
+
+### Terminal keybinding
+
+Bind a key combo in your terminal to launch the picker instantly.
+
+**iTerm2** (Preferences → Keys → Key Bindings → +):
+- Action: "Send Text with vim Special Chars"
+- Text: `claude-sessions\n`
+
+**Wezterm** (`~/.wezterm.lua`):
+```lua
+{ key = "s", mods = "CTRL|SHIFT", action = wezterm.action.SendString("claude-sessions\n") }
+```
+
+### Raycast / Alfred (macOS)
+
+Launch from a macOS app launcher with an optional search query.
+
+<details>
+<summary>Raycast script command</summary>
+
+Create `~/.raycast-scripts/claude-sessions.sh`:
 
 ```bash
 #!/bin/bash
@@ -133,7 +161,32 @@ EOF
 # osascript -e "tell application \"Terminal\" to do script \"claude-sessions '$SEARCH_QUERY'\""
 ```
 
-Then add `~/.raycast-scripts/` as a script directory in Raycast preferences.
+Add `~/.raycast-scripts/` as a script directory in Raycast preferences.
+
+</details>
+
+<details>
+<summary>Alfred workflow</summary>
+
+Create a workflow with a **Keyword** input (e.g., `cs`) connected to a **Run Script** action:
+
+```bash
+osascript -e "tell application \"Terminal\" to do script \"claude-sessions '{query}'\""
+```
+
+Replace `Terminal` with `iTerm` and adjust the AppleScript if you use iTerm2 (see Raycast example above).
+
+</details>
+
+### Claude Code custom slash command
+
+Add to your `~/.claude/commands/sessions.md`:
+
+```
+Find and resume a Claude Code session. Run: claude-sessions $ARGUMENTS
+```
+
+Then type `/sessions auth bug` inside Claude Code to launch the picker with a pre-filled search.
 
 ## Testing
 
