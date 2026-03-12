@@ -136,28 +136,40 @@ function reldate(ep,    d) {
         echo -e "\033[33m⚠ ${compact_n}x compacted — long session\033[0m"
         echo ""
       fi
+      # Extract text from user+assistant messages, then filter.
+      # jq extracts text FIRST so tool_use JSON, file contents, etc. are excluded.
+      extract='"\"type\":\"(user|assistant)\""'
+      jq_text='"
+        select(.message.content) |
+        .type as \$t |
+        .message.content |
+        (if type == \"string\" then .
+         elif type == \"array\" then
+           [.[] | select(.type == \"text\") | .text] | join(\" \")
+         else \"\" end) |
+        select(length > 0) |
+        if \$t == \"user\" then \"[U] \" + .[0:300]
+        else \"[A] \" + .[0:300] end"'
       if [[ -n "$query" ]]; then
         pat=$(echo "$query" | tr " " "\n" | grep -v "^$" | paste -sd "|" -)
         if [[ -n "$pat" ]]; then
           grep -E "\"type\":\"(user|assistant)\"" "$f" 2>/dev/null | \
-            grep -iE "$pat" | head -20 | \
-            jq -r "
-              .message.content
-              | if type == \"string\" then .[0:500]
-                elif type == \"array\" then
-                  [.[] | select(.type == \"text\") | .text] | join(\" \") | .[0:500]
-                else empty end" 2>/dev/null | while IFS= read -r line; do
-            [[ -n "$line" ]] && echo -e "\033[36m>\033[0m $line" && echo
+            jq -r "$jq_text" 2>/dev/null | \
+            grep -iE "$pat" | head -15 | while IFS= read -r line; do
+            role="${line:0:3}"
+            text="${line:4}"
+            if [[ "$role" == "[U]" ]]; then
+              echo -e "\033[32m▸\033[0m $text" && echo
+            else
+              echo -e "\033[36m▹\033[0m $text" && echo
+            fi
           done
         fi
       else
-        grep "\"type\":\"user\"" "$f" 2>/dev/null | head -12 | jq -r "
-          .message.content
-          | if type == \"string\" then .[0:500]
-            elif type == \"array\" then
-              [.[] | select(.type == \"text\") | .text] | join(\" \") | .[0:500]
-            else empty end" 2>/dev/null | while IFS= read -r line; do
-          [[ -n "$line" ]] && echo -e "\033[36m>\033[0m $line" && echo
+        grep "\"type\":\"user\"" "$f" 2>/dev/null | head -12 | jq -r "$jq_text" 2>/dev/null | \
+          while IFS= read -r line; do
+          text="${line:4}"
+          [[ -n "$text" ]] && echo -e "\033[36m>\033[0m $text" && echo
         done
       fi
     else

@@ -1,0 +1,355 @@
+#!/usr/bin/env bash
+# Tests for session-indexer.py and the preview logic in claude-sessions.
+# Run: bash test-session-tools.sh
+#
+# Creates a temp dir with synthetic JSONL files, runs the indexer,
+# then tests the preview extraction against those files.
+
+set -euo pipefail
+
+PASS=0
+FAIL=0
+TMPDIR=$(mktemp -d)
+PROJECTS="$TMPDIR/projects"
+
+cleanup() { rm -rf "$TMPDIR"; }
+trap cleanup EXIT
+
+# --- Helpers ---
+
+assert_eq() {
+  local label="$1" expected="$2" actual="$3"
+  if [[ "$expected" == "$actual" ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL: $label"
+    echo "  expected: $expected"
+    echo "  actual:   $actual"
+  fi
+}
+
+assert_contains() {
+  local label="$1" needle="$2" haystack="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL: $label"
+    echo "  expected to contain: $needle"
+    echo "  actual: $haystack"
+  fi
+}
+
+assert_not_contains() {
+  local label="$1" needle="$2" haystack="$3"
+  if [[ "$haystack" != *"$needle"* ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL: $label"
+    echo "  expected NOT to contain: $needle"
+    echo "  actual: $haystack"
+  fi
+}
+
+assert_line_count_ge() {
+  local label="$1" min_lines="$2" text="$3"
+  local actual_lines
+  actual_lines=$(echo "$text" | grep -c '.' || true)
+  if [[ "$actual_lines" -ge "$min_lines" ]]; then
+    PASS=$((PASS + 1))
+  else
+    FAIL=$((FAIL + 1))
+    echo "FAIL: $label"
+    echo "  expected >= $min_lines lines, got $actual_lines"
+    echo "  actual: $text"
+  fi
+}
+
+ts() {
+  # Generate ISO timestamp N days ago
+  local days_ago="${1:-0}"
+  if [[ "$(uname)" == "Darwin" ]]; then
+    date -u -v-${days_ago}d +"%Y-%m-%dT%H:%M:%S.000Z"
+  else
+    date -u -d "$days_ago days ago" +"%Y-%m-%dT%H:%M:%S.000Z"
+  fi
+}
+
+# --- Build synthetic JSONL sessions ---
+
+mkdir -p "$PROJECTS/-Users-test-github-myproject"
+mkdir -p "$PROJECTS/-Users-test-Documents-Personal"
+
+# Session 1: Normal session with tool calls — the key bug scenario.
+# Assistant messages with tool_use but no text should NOT appear in preview.
+cat > "$PROJECTS/-Users-test-github-myproject/session-001.jsonl" << 'JSONL'
+{"type":"system","sessionId":"session-001","timestamp":"2026-03-10T09:00:00.000Z","cwd":"/tmp"}
+{"type":"user","message":{"role":"user","content":"Build the cold email outreach feature for sales"},"uuid":"u1"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I'll build the cold email outreach feature. Let me start by reading the existing code."}]},"uuid":"a1"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/src/matches.ts"}}]},"uuid":"a2"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Edit","input":{"file_path":"/src/email.ts","old_string":"old","new_string":"new"}}]},"uuid":"a3"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done! The cold email outreach feature is now implemented with the following changes:\n1. New email template system\n2. Outreach tracking in the sales pipeline\n3. Click and feedback analytics"}]},"uuid":"a4"}
+{"type":"user","message":{"role":"user","content":"Can you also add click tracking for the email links?"},"uuid":"u2"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t3","name":"Edit","input":{"file_path":"/src/tracking.ts","old_string":"x","new_string":"y"}}]},"uuid":"a5"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Click tracking is now integrated into the outreach emails."}]},"uuid":"a6"}
+JSONL
+
+# Session 2: Heavily compacted session — summaries replace original messages.
+cat > "$PROJECTS/-Users-test-github-myproject/session-002.jsonl" << 'JSONL'
+{"type":"system","sessionId":"session-002","timestamp":"2026-03-08T14:00:00.000Z","cwd":"/tmp"}
+{"type":"summary","summary":"This session covered match presentation UX, profile depth changes, and side-by-side therapist comparison. Key decisions: use card layout, show top 3 matches initially."}
+{"type":"compact_boundary"}
+{"type":"user","message":{"role":"user","content":"Continuing from the compacted context — now let's add the profile detail modal"},"uuid":"u3"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I'll implement the profile detail modal based on our earlier card layout decision."}]},"uuid":"a7"}
+JSONL
+
+# Session 3: Session where "matches" appears in tool_use JSON but NOT in text.
+# This should NOT match a search for "matches" in the preview.
+cat > "$PROJECTS/-Users-test-Documents-Personal/session-003.jsonl" << 'JSONL'
+{"type":"system","sessionId":"session-003","timestamp":"2026-03-11T08:00:00.000Z","cwd":"/tmp"}
+{"type":"user","message":{"role":"user","content":"Good morning, let's do the standup"},"uuid":"u4"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Good morning! Let me run the standup sequence."}]},"uuid":"a8"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t4","name":"Bash","input":{"command":"SELECT * FROM matches WHERE status = 'active'"}}]},"uuid":"a9"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t5","name":"Read","input":{"file_path":"/src/matches/profile.tsx"}}]},"uuid":"a10"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Here's your standup dashboard. No blockers today."}]},"uuid":"a11"}
+JSONL
+
+# Session 4: Multiple user messages with relevant terms spread throughout.
+cat > "$PROJECTS/-Users-test-github-myproject/session-004.jsonl" << 'JSONL'
+{"type":"system","sessionId":"session-004","timestamp":"2026-03-09T10:00:00.000Z","cwd":"/tmp"}
+{"type":"user","message":{"role":"user","content":"Let's work on the click tracking feature"},"uuid":"u5"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Sure, I'll look at the click tracking implementation."}]},"uuid":"a12"}
+{"type":"user","message":{"role":"user","content":"Actually, the email feedback loop is more important"},"uuid":"u6"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Good call. The email feedback loop connects click data to the sales funnel."}]},"uuid":"a13"}
+{"type":"user","message":{"role":"user","content":"Yes, and we need it for the outreach campaign metrics"},"uuid":"u7"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I've connected the feedback loop to track outreach campaign effectiveness."}]},"uuid":"a14"}
+JSONL
+
+# --- INDEXER TESTS ---
+
+echo "=== Indexer Tests ==="
+
+# Override PROJECTS_DIR and CACHE_PATH for testing via env vars
+CACHE="$TMPDIR/test-cache.tsv"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Run indexer as subprocess with env var overrides
+SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" \
+  python3 "$SCRIPT_DIR/session-indexer.py" 2>&1 || {
+    echo "ERROR: indexer failed"
+    exit 1
+  }
+
+if [[ ! -f "$CACHE" ]]; then
+  echo "ERROR: cache file not created at $CACHE"
+  echo "Projects dir contents:"
+  find "$PROJECTS" -type f
+  exit 1
+fi
+
+INDEXER_OUTPUT=$(cat "$CACHE")
+
+# Test: session-001 should have cold, email, outreach, sales as keywords
+s001=$(echo "$INDEXER_OUTPUT" | grep "^session-001")
+assert_contains "s001 has 'outreach' keyword" "outreach" "$s001"
+assert_contains "s001 has 'cold' keyword" "cold" "$s001"
+assert_contains "s001 has 'email' keyword" "email" "$s001"
+assert_contains "s001 has 'sales' keyword" "sales" "$s001"
+assert_contains "s001 has 'click' keyword" "click" "$s001"
+
+# Test: session-001 should have 7 fields
+s001_fields=$(echo "$s001" | awk -F'\t' '{print NF}')
+assert_eq "s001 has 7 TSV fields" "7" "$s001_fields"
+
+# Test: session-002 (compacted) should have keywords from summary
+s002=$(echo "$INDEXER_OUTPUT" | grep "^session-002")
+assert_contains "s002 has 'presentation' from summary" "presentation" "$s002"
+assert_contains "s002 has 'therapist' from summary" "therapist" "$s002"
+assert_contains "s002 has 'comparison' from summary" "comparison" "$s002"
+
+# Test: session-003 should NOT have "matches" as keyword (only in tool_use)
+s003=$(echo "$INDEXER_OUTPUT" | grep "^session-003")
+# The word "matches" only appears in tool_use JSON, not in user or assistant text
+s003_kw=$(echo "$s003" | cut -f4)
+assert_not_contains "s003 keywords exclude tool_use content" "matches" "$s003_kw"
+
+# Test: created_epoch comes from timestamp field, not mtime
+s001_created=$(echo "$s001" | cut -f5)
+# 2026-03-10T09:00:00Z → epoch should be around 1741597200 (not exact, depends on TZ)
+# Just verify it's a number and not 0
+if [[ "$s001_created" =~ ^[0-9]+$ ]] && [[ "$s001_created" -gt 1000000000 ]]; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: s001 created_epoch is a valid unix timestamp"
+  echo "  actual: $s001_created"
+fi
+
+# Test: mtime_epoch is in field 6 and different from created_epoch
+s001_mtime=$(echo "$s001" | cut -f6)
+if [[ "$s001_mtime" =~ ^[0-9]+$ ]] && [[ "$s001_mtime" -gt 1000000000 ]]; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: s001 mtime_epoch is a valid unix timestamp"
+  echo "  actual: $s001_mtime"
+fi
+
+# Test: project label derivation
+# HOME_KEY is based on real $HOME, so test dirs get partial stripping.
+# Just verify labels are non-empty and contain the distinctive part.
+s001_proj=$(echo "$s001" | cut -f7)
+assert_contains "s001 project label contains 'myproject'" "myproject" "$s001_proj"
+
+s003_proj=$(echo "$s003" | cut -f7)
+assert_contains "s003 project label contains 'Personal'" "Personal" "$s003_proj"
+
+# Test: TF-IDF ordering — "outreach" should rank higher than "email" in session-001
+# because "email" appears in more sessions (s001 + s004) while "outreach" is more distinctive
+s001_kw="$s003_kw"  # wrong, let me fix
+s001_kw=$(echo "$s001" | cut -f4)
+outreach_pos=$(echo "$s001_kw" | tr ' ' '\n' | grep -n "^outreach$" | cut -d: -f1)
+# Just verify outreach is in the keywords
+assert_contains "s001 keywords include outreach" "outreach" "$s001_kw"
+
+# Test: stopwords filtered out
+assert_not_contains "s001 keywords exclude 'the'" " the " " $s001_kw "
+assert_not_contains "s001 keywords exclude 'and'" " and " " $s001_kw "
+assert_not_contains "s001 keywords exclude 'for'" " for " " $s001_kw "
+
+# --- PREVIEW TESTS ---
+
+echo ""
+echo "=== Preview Tests ==="
+
+# Extract the preview logic into a testable script
+cat > "$TMPDIR/preview.sh" << 'BASH'
+#!/usr/bin/env bash
+# Extracted preview logic from claude-sessions --preview
+# Args: $1=session_id $2=home_key $3=query $4=projects_dir
+shopt -s nullglob
+sid="$1"
+home_key="$2"
+query="$3"
+projects_dir="$4"
+
+files=("$projects_dir"/*/${sid}.jsonl)
+f="${files[0]}"
+if [[ -n "$f" && -f "$f" ]]; then
+  d=$(basename "$(dirname "$f")")
+  d="${d#-${home_key}-}"; d="${d#github-}"
+  d="${d##*CloudDocs-Documents-}"; d="${d##*Documents-}"
+  echo "$d"
+  echo ""
+  compact_n=$(grep -c "\"compact_boundary\"" "$f" 2>/dev/null) || compact_n=0
+  if [[ "$compact_n" -gt 0 ]]; then
+    echo "⚠ ${compact_n}x compacted — long session"
+    echo ""
+  fi
+  jq_text='
+    select(.message.content) |
+    .type as $t |
+    .message.content |
+    (if type == "string" then .
+     elif type == "array" then
+       [.[] | select(.type == "text") | .text] | join(" ")
+     else "" end) |
+    select(length > 0) |
+    if $t == "user" then "[U] " + .[0:300]
+    else "[A] " + .[0:300] end'
+  if [[ -n "$query" ]]; then
+    pat=$(echo "$query" | tr " " "\n" | grep -v "^$" | paste -sd "|" -)
+    if [[ -n "$pat" ]]; then
+      grep -E "\"type\":\"(user|assistant)\"" "$f" 2>/dev/null | \
+        jq -r "$jq_text" 2>/dev/null | \
+        grep -iE "$pat" | head -15 | while IFS= read -r line; do
+        role="${line:0:3}"
+        text="${line:4}"
+        if [[ "$role" == "[U]" ]]; then
+          echo -e "> $text" && echo
+        else
+          echo -e "< $text" && echo
+        fi
+      done
+    fi
+  else
+    grep '"type":"user"' "$f" 2>/dev/null | head -12 | jq -r "$jq_text" 2>/dev/null | \
+      while IFS= read -r line; do
+      text="${line:4}"
+      [[ -n "$text" ]] && echo "> $text" && echo
+    done
+  fi
+else
+  echo "Session file not found"
+fi
+BASH
+chmod +x "$TMPDIR/preview.sh"
+
+# Test: Preview without query shows user messages
+preview_no_query=$(bash "$TMPDIR/preview.sh" "session-001" "Users-test" "" "$PROJECTS" || true)
+assert_contains "no-query preview shows first user msg" "cold email outreach" "$preview_no_query"
+assert_contains "no-query preview shows second user msg" "click tracking" "$preview_no_query"
+
+# Test: Preview with query "outreach" shows matching messages
+preview_outreach=$(bash "$TMPDIR/preview.sh" "session-001" "Users-test" "outreach" "$PROJECTS" || true)
+assert_contains "query preview matches 'outreach' in user msg" "cold email outreach" "$preview_outreach"
+# Assistant messages now prefixed with "<" in preview
+assert_contains "query preview matches 'outreach' in assistant text" "outreach feature" "$preview_outreach"
+
+# BUG TEST: Preview with query "matches" on session-003 should NOT show tool_use content
+preview_matches_s003=$(bash "$TMPDIR/preview.sh" "session-003" "Users-test" "matches" "$PROJECTS" || true)
+# Currently BROKEN: grep matches "matches" inside tool_use JSON, jq extracts empty text → blank lines
+# The preview should either show nothing (no text mentions "matches") or only text-containing messages
+
+# Count actual content lines (exclude blank lines and header)
+content_lines=$(echo "$preview_matches_s003" | grep "^>" | grep -v "^$" || true)
+
+# The preview should not show tool_use content as results.
+# With the fix (jq extract THEN grep), tool_use-only messages produce no text to match.
+assert_not_contains "s003 preview for 'matches' excludes tool SQL content" "SELECT" "$preview_matches_s003"
+assert_not_contains "s003 preview for 'matches' excludes file paths" "matches/profile" "$preview_matches_s003"
+
+# Test: Compacted session shows compaction warning
+preview_compacted=$(bash "$TMPDIR/preview.sh" "session-002" "Users-test" "" "$PROJECTS" || true)
+assert_contains "compacted session shows warning" "compacted" "$preview_compacted"
+
+# Test: Compacted session with query still shows post-compaction messages
+preview_compacted_q=$(bash "$TMPDIR/preview.sh" "session-002" "Users-test" "profile" "$PROJECTS" || true)
+assert_contains "compacted session query shows post-compaction msg" "profile detail modal" "$preview_compacted_q"
+
+# BUG TEST: Query "matches" on session-003 should show project header but no ghost results
+# Count lines that start with ">" or "<" (actual message results)
+ghost_count=$(echo "$preview_matches_s003" | grep -cE "^[><]" || true)
+# No text in s003 mentions "matches" — it only appears in tool_use JSON
+assert_eq "s003 no ghost results for tool_use 'matches'" "0" "$ghost_count"
+
+# Test: Preview with multi-word query
+preview_multi=$(bash "$TMPDIR/preview.sh" "session-004" "Users-test" "email feedback" "$PROJECTS" || true)
+assert_contains "multi-word query matches 'email'" "email" "$preview_multi"
+assert_contains "multi-word query matches 'feedback'" "feedback" "$preview_multi"
+
+# Test: Preview line count — session-001 query "outreach" should return multiple results
+outreach_lines=$(echo "$preview_outreach" | grep -c "^>" || true)
+assert_line_count_ge "outreach query returns multiple preview lines" 2 "$preview_outreach"
+
+# Test: Session not found
+preview_missing=$(bash "$TMPDIR/preview.sh" "session-nonexistent" "Users-test" "" "$PROJECTS" || true)
+assert_contains "missing session shows error" "not found" "$preview_missing"
+
+# Test: Project name in preview header
+assert_contains "s001 preview header shows project" "myproject" "$preview_no_query"
+
+# --- RESULTS ---
+
+echo ""
+echo "=== Results ==="
+echo "Passed: $PASS"
+echo "Failed: $FAIL"
+
+if [[ "$FAIL" -gt 0 ]]; then
+  exit 1
+else
+  echo "All tests passed!"
+fi

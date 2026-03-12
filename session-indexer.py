@@ -15,8 +15,10 @@ from datetime import datetime, timezone
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 
-PROJECTS_DIR = os.path.join(os.path.expanduser("~"), ".claude", "projects")
-CACHE_PATH = os.path.join(os.path.expanduser("~"), ".claude", ".sessions-unified-cache.tsv")
+PROJECTS_DIR = os.environ.get("SESSION_PROJECTS_DIR",
+    os.path.join(os.path.expanduser("~"), ".claude", "projects"))
+CACHE_PATH = os.environ.get("SESSION_CACHE_PATH",
+    os.path.join(os.path.expanduser("~"), ".claude", ".sessions-unified-cache.tsv"))
 HOME_KEY = os.path.expanduser("~").replace("/", "-").lstrip("-")
 
 TOKEN_RE = re.compile(r'[a-z0-9][a-z0-9_-]{2,40}')
