@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tests for session-indexer.py and the preview logic in claude-sessions.
+# Tests for session_indexer.py and the preview logic in claude-sessions.
 # Run: bash test-session-tools.sh
 #
 # Creates a temp dir with synthetic JSONL files, runs the indexer,
@@ -131,13 +131,14 @@ JSONL
 
 echo "=== Indexer Tests ==="
 
-# Override PROJECTS_DIR and CACHE_PATH for testing via env vars
+# Override PROJECTS_DIR, CACHE_PATH, and DB_PATH for testing via env vars
 CACHE="$TMPDIR/test-cache.tsv"
+TEST_DB="$TMPDIR/test-sessions.db"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Run indexer as subprocess with env var overrides
-SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" \
-  python3 "$SCRIPT_DIR/session-indexer.py" 2>&1 || {
+SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" SESSION_DB_PATH="$TEST_DB" \
+  python3 "$SCRIPT_DIR/session_indexer.py" 2>&1 || {
     echo "ERROR: indexer failed"
     exit 1
   }
@@ -214,10 +215,12 @@ outreach_pos=$(echo "$s001_kw" | tr ' ' '\n' | grep -n "^outreach$" | cut -d: -f
 # Just verify outreach is in the keywords
 assert_contains "s001 keywords include outreach" "outreach" "$s001_kw"
 
-# Test: stopwords filtered out
-assert_not_contains "s001 keywords exclude 'the'" " the " " $s001_kw "
-assert_not_contains "s001 keywords exclude 'and'" " and " " $s001_kw "
-assert_not_contains "s001 keywords exclude 'for'" " for " " $s001_kw "
+# Test: field 4 is now body excerpt (raw text), not keyword tokens.
+# Stopword filtering is handled by FTS5 internally, not in the stored text.
+# Verify body excerpt contains meaningful content from the conversation.
+assert_contains "s001 body excerpt has conversation text" "outreach" "$s001_kw"
+assert_contains "s001 body excerpt has user message" "click tracking" "$s001_kw"
+assert_contains "s001 body excerpt has assistant text" "implemented" "$s001_kw"
 
 # --- SEARCH SCORING TESTS ---
 
@@ -225,8 +228,8 @@ echo ""
 echo "=== Search Scoring Tests ==="
 
 # Test: "cold email outreach" should rank session-001 first (title/preview match)
-search_outreach=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" \
-  python3 "$SCRIPT_DIR/session-indexer.py" --search "cold email outreach")
+search_outreach=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" SESSION_DB_PATH="$TEST_DB" \
+  python3 "$SCRIPT_DIR/session_indexer.py" --search "cold email outreach")
 
 first_result=$(echo "$search_outreach" | head -1 | cut -f1)
 assert_eq "search 'cold email outreach' ranks s001 first" "session-001" "$first_result"
@@ -234,60 +237,60 @@ assert_eq "search 'cold email outreach' ranks s001 first" "session-001" "$first_
 # Test: session with term in title/preview ranks above session with term only in keywords
 # "outreach" appears in s001's preview text and s004's keywords (via "outreach campaign metrics")
 # s001 should rank higher because it has "outreach" prominently in the preview
-search_outreach_only=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" \
-  python3 "$SCRIPT_DIR/session-indexer.py" --search "outreach")
+search_outreach_only=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" SESSION_DB_PATH="$TEST_DB" \
+  python3 "$SCRIPT_DIR/session_indexer.py" --search "outreach")
 
 outreach_first=$(echo "$search_outreach_only" | head -1 | cut -f1)
 assert_eq "search 'outreach' ranks s001 first (preview match > keyword)" "session-001" "$outreach_first"
 
 # Test: "click tracking feedback" should return both s001 and s004
-search_click=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" \
-  python3 "$SCRIPT_DIR/session-indexer.py" --search "click tracking feedback")
+search_click=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" SESSION_DB_PATH="$TEST_DB" \
+  python3 "$SCRIPT_DIR/session_indexer.py" --search "click tracking feedback")
 assert_contains "search 'click tracking feedback' includes s001" "session-001" "$search_click"
 assert_contains "search 'click tracking feedback' includes s004" "session-004" "$search_click"
 
 # Test: "standup" should return session-003
-search_standup=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" \
-  python3 "$SCRIPT_DIR/session-indexer.py" --search "standup")
+search_standup=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" SESSION_DB_PATH="$TEST_DB" \
+  python3 "$SCRIPT_DIR/session_indexer.py" --search "standup")
 assert_contains "search 'standup' finds s003" "session-003" "$search_standup"
 
 # Test: project filter works
-search_proj=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" \
-  python3 "$SCRIPT_DIR/session-indexer.py" --search "email --project myproject")
+search_proj=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" SESSION_DB_PATH="$TEST_DB" \
+  python3 "$SCRIPT_DIR/session_indexer.py" --search "email --project myproject")
 assert_contains "project filter includes s001 (myproject)" "session-001" "$search_proj"
 assert_not_contains "project filter excludes s003 (Personal)" "session-003" "$search_proj"
 
 # Test: negation excludes correctly
-search_neg=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" \
-  python3 "$SCRIPT_DIR/session-indexer.py" --search "email --exclude standup")
+search_neg=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" SESSION_DB_PATH="$TEST_DB" \
+  python3 "$SCRIPT_DIR/session_indexer.py" --search "email --exclude standup")
 assert_not_contains "negation excludes s003 (has 'standup' in text)" "session-003" "$search_neg"
 
 # Test: empty query returns nothing (no crash)
-search_empty=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" \
-  python3 "$SCRIPT_DIR/session-indexer.py" --search "")
+search_empty=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" SESSION_DB_PATH="$TEST_DB" \
+  python3 "$SCRIPT_DIR/session_indexer.py" --search "")
 empty_count=$(echo "$search_empty" | grep -c '.' || true)
 # Empty string has 1 line from echo, but should be blank
 assert_eq "empty query returns no results" "0" "$empty_count"
 
 # Test: IDF weighting — common terms score less than rare terms
 # "email" appears in s001 + s004 (common), "standup" only in s003 (rare)
-# Search for both: the session with the rare term should rank high
-search_idf=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" \
-  python3 "$SCRIPT_DIR/session-indexer.py" --search "standup email")
+# FTS5 uses AND by default, so use OR to test cross-session IDF ranking
+search_idf=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" SESSION_DB_PATH="$TEST_DB" \
+  python3 "$SCRIPT_DIR/session_indexer.py" --search "standup OR email")
 idf_first=$(echo "$search_idf" | head -1 | cut -f1)
 # s003 has "standup" (rare, high IDF) in preview; s001/s004 have "email" (common, low IDF)
-# s003 should rank first because "standup" has higher IDF and appears in preview (weight 8)
+# s003 should rank first because "standup" has higher IDF via BM25
 assert_eq "IDF: rare term 'standup' boosts s003 above common 'email'" "session-003" "$idf_first"
 
 # Test: exact phrase matching
-search_phrase=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" \
-  python3 "$SCRIPT_DIR/session-indexer.py" --search '"cold email outreach"')
+search_phrase=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" SESSION_DB_PATH="$TEST_DB" \
+  python3 "$SCRIPT_DIR/session_indexer.py" --search '"cold email outreach"')
 phrase_first=$(echo "$search_phrase" | head -1 | cut -f1)
 assert_eq "exact phrase '\"cold email outreach\"' ranks s001 first" "session-001" "$phrase_first"
 
 # Test: search result format is valid 7-field TSV
-search_format=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" \
-  python3 "$SCRIPT_DIR/session-indexer.py" --search "email")
+search_format=$(SESSION_PROJECTS_DIR="$PROJECTS" SESSION_CACHE_PATH="$CACHE" SESSION_DB_PATH="$TEST_DB" \
+  python3 "$SCRIPT_DIR/session_indexer.py" --search "email")
 format_fields=$(echo "$search_format" | head -1 | awk -F'\t' '{print NF}')
 assert_eq "search results have 7 TSV fields" "7" "$format_fields"
 

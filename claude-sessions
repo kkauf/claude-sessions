@@ -36,7 +36,7 @@ current_label() {
 
 # --- Build/update cache (Python indexer — 40-70x faster than bash) ---
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}")")" && pwd)"
-python3 "$SCRIPT_DIR/session-indexer.py" || { echo "Indexer failed" >&2; exit 1; }
+python3 "$SCRIPT_DIR/session_indexer.py" || { echo "Indexer failed" >&2; exit 1; }
 
 if [[ ! -s "$UNIFIED_CACHE" ]]; then
   echo "No sessions found." >&2
@@ -109,7 +109,7 @@ search_query="${1:-}"
 
 if [[ -n "$search_query" ]]; then
   # Python-scored mode: pre-ranked results, fzf is display + selection only
-  scored_results=$(python3 "$SCRIPT_DIR/session-indexer.py" --search "$search_query")
+  scored_results=$(python3 "$SCRIPT_DIR/session_indexer.py" --search "$search_query")
   if [[ -z "$scored_results" ]]; then
     echo "No sessions matched: $search_query" >&2
     exit 1
