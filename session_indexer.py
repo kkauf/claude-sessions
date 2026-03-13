@@ -463,6 +463,73 @@ def write_cache(conn, cache_path=None):
     return len(rows)
 
 
+# --- fzf output formatting ---
+
+PAD = ' ' * 300
+
+
+def _reldate(epoch):
+    """Format epoch as relative date string for display."""
+    local = time.localtime()
+    midnight = int(time.mktime(time.struct_time((
+        local.tm_year, local.tm_mon, local.tm_mday,
+        0, 0, 0, 0, 0, local.tm_isdst
+    ))))
+    if epoch >= midnight:
+        return "today"
+    d = (midnight - epoch - 1) // 86400 + 1
+    if d == 1:
+        return " 1d  "
+    if d < 7:
+        return f"{d:2d}d  "
+    if d < 30:
+        return f"{d // 7:2d}w  "
+    if d < 365:
+        return f"{d // 30:2d}mo "
+    return f"{d // 365:2d}y  "
+
+
+def format_fzf_line(sid, title, preview, body, project, created_epoch, mtime_epoch, current_label=''):
+    """Format a session as fzf-ready line: SID\\tDISPLAY+PAD+SEARCH."""
+    rd = _reldate(created_epoch)
+
+    # Project tag (only for other projects)
+    tag = ""
+    if project and project != current_label:
+        tag = f"  \033[2m\u00b7 {project}\033[0m"
+
+    # Display: date + title or preview + optional project tag
+    if title:
+        display = f"\033[33m{rd:<5}\033[0m \033[1m{title}\033[0m{tag}"
+    else:
+        p = (preview[:77] + "...") if len(preview) > 80 else preview
+        display = f"\033[33m{rd:<5}\033[0m {p}{tag}"
+
+    # Search text (pushed off-screen by padding)
+    excerpt = ' '.join((body or '').split())[:300]
+    search_text = f"{title} {excerpt} {preview} {project}"
+
+    return f"{sid}\t{display}{PAD}{search_text}"
+
+
+def fzf_output(conn, query='', current_label=''):
+    """Output fzf-formatted lines: search results or all sessions by recency."""
+    if query and query.strip():
+        results = search(conn, query)
+        for r in results:
+            print(format_fzf_line(
+                r['sid'], r['title'], r['preview'], r['body'],
+                r['project'], r['created_epoch'], r['mtime_epoch'], current_label
+            ))
+    else:
+        rows = conn.execute("""
+            SELECT sid, title, preview, body, project, created_epoch, mtime_epoch
+            FROM sessions ORDER BY mtime_epoch DESC
+        """).fetchall()
+        for row in rows:
+            print(format_fzf_line(*row, current_label=current_label))
+
+
 # --- Filesystem scan ---
 
 def project_label(dirname):
@@ -507,22 +574,36 @@ def scan_all_files():
 
 # --- Main ---
 
+def _get_arg(flag):
+    """Get the value after a CLI flag, or None."""
+    for i, arg in enumerate(sys.argv):
+        if arg == flag and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return None
+
+
 def main():
     t0 = time.monotonic()
     timing = "--timing" in sys.argv
     force = "--rebuild" in sys.argv
+    fzf_mode = "--fzf" in sys.argv
+    search_query = _get_arg("--search")
+    label = _get_arg("--label") or ''
 
-    # Search mode
-    search_idx = None
-    for i, arg in enumerate(sys.argv):
-        if arg == "--search":
-            search_idx = i
-            break
-
-    if search_idx is not None:
-        query = sys.argv[search_idx + 1] if search_idx + 1 < len(sys.argv) else ""
+    # fzf mode: output formatted lines for fzf display (used by reload)
+    if fzf_mode:
         conn = init_db()
-        results = search(conn, query)
+        fzf_output(conn, query=search_query or '', current_label=label)
+        conn.close()
+        if timing:
+            elapsed = (time.monotonic() - t0) * 1000
+            print(f"fzf: {elapsed:.0f}ms", file=sys.stderr)
+        return
+
+    # Search mode: raw TSV output (for scripts/tests)
+    if search_query is not None:
+        conn = init_db()
+        results = search(conn, search_query)
         for r in results:
             excerpt = ' '.join(r['body'].split())[:600]
             print(f"{r['sid']}\t{r['title']}\t{r['preview']}\t{excerpt}\t{r['created_epoch']}\t{r['mtime_epoch']}\t{r['project']}")
@@ -532,7 +613,7 @@ def main():
             print(f"search: {len(results)} results, {elapsed:.0f}ms", file=sys.stderr)
         return
 
-    # Index mode
+    # Index mode: sync DB + write cache
     if not os.path.isdir(PROJECTS_DIR):
         sys.exit(0)
 

@@ -48,112 +48,46 @@ session_count=$(wc -l < "$UNIFIED_CACHE" | tr -d ' ')
 # --- Derive current project label for tagging ---
 CL=$(current_label)
 
-# --- Format for fzf ---
+# --- fzf with dynamic FTS5 reload ---
 #
-# Architecture: 2-field fzf input
-#   F1: session_id     (hidden via --with-nth=2)
-#   F2: display + 300 spaces padding + search keywords (TF-IDF ordered)
+# Architecture: Python formats display lines, fzf delegates ALL search to FTS5.
+#   --phony: disables fzf's own matching (no fuzzy highlight artifacts)
+#   change:reload: every keystroke triggers a FTS5 query via Python
 #
-# --with-nth=2 hides F1 (SID) and shows only F2.
-# The 300-space padding pushes keywords off-screen, but fzf still searches them.
-# --no-hscroll prevents fzf from scrolling to show off-screen keyword matches.
-#
-# Two modes:
-#   1. Query provided → Python scores & ranks, fzf is display + selection only (--no-sort)
-#   2. No query → fzf does interactive search with --tiebreak=index (recency)
-#
-# Preview uses bash -c explicitly (fzf defaults to $SHELL which may be zsh).
-
-PAD=$(printf '%300s' '')
-
-# Shared awk formatter: reads 7-field TSV, produces ANSI display lines
-awk_format() {
-  awk -F'\t' -v cl="$CL" -v mid="$(date -j -v0H -v0M -v0S +%s 2>/dev/null || date -d 'today 0' +%s)" -v pad="$PAD" -v home_key="$HOME_KEY" '
-  function reldate(ep,    d) {
-    if (ep >= mid) return "today"
-    d = int((mid - ep - 1) / 86400) + 1
-    if (d == 1) return " 1d  "
-    if (d < 7) return sprintf("%2dd  ", d)
-    if (d < 30) return sprintf("%2dw  ", int(d/7))
-    if (d < 365) return sprintf("%2dmo ", int(d/30))
-    return sprintf("%2dy  ", int(d/365))
-  }
-  {
-    sid=$1; title=$2; preview=$3; kw=$4; created=$5; proj=$7
-
-    rd = reldate(created)
-
-    # Project tag (only for other projects)
-    tag = ""
-    if (proj != cl && proj != "") tag = "  \033[2m\302\267 " proj "\033[0m"
-
-    # Display: date + title or preview + optional project tag
-    if (title != "") {
-      line = sprintf("\033[33m%-5s\033[0m \033[1m%s\033[0m%s", rd, title, tag)
-    } else {
-      p = preview
-      if (length(p) > 80) p = substr(p, 1, 77) "..."
-      line = sprintf("\033[33m%-5s\033[0m %s%s", rd, p, tag)
-    }
-
-    # Search text: title > topic boost > keywords > preview > project
-    n = split(kw, kw_arr, " ")
-    topic = ""
-    for (i = 1; i <= 15 && i <= n; i++) topic = topic " " kw_arr[i]
-    search = title " " topic " " kw " " preview " " proj
-    printf "%s\t%s%s%s\n", sid, line, pad, search
-  }'
-}
+# Initial results: pre-scored (if query given) or all by recency.
+# Typing replaces the list entirely with fresh FTS5 results.
 
 search_query="${1:-}"
 
+# Generate initial results (Python handles formatting with ANSI colors)
 if [[ -n "$search_query" ]]; then
-  # Python-scored mode: pre-ranked results, fzf is display + selection only
-  scored_results=$(python3 "$SCRIPT_DIR/session_indexer.py" --search "$search_query")
-  if [[ -z "$scored_results" ]]; then
+  initial=$(python3 "$SCRIPT_DIR/session_indexer.py" --fzf --label "$CL" --search "$search_query")
+  if [[ -z "$initial" ]]; then
     echo "No sessions matched: $search_query" >&2
     exit 1
   fi
-  scored_count=$(echo "$scored_results" | wc -l | tr -d ' ')
-
-  selected=$(echo "$scored_results" | awk_format | fzf \
-    --ansi \
-    --delimiter='\t' \
-    --with-nth=2 \
-    -i \
-    --no-hscroll \
-    --no-sort \
-    --header="$scored_count matches (of $session_count) · ctrl-/ toggle preview" \
-    --bind="ctrl-/:toggle-preview" \
-    --height=80% \
-    --reverse \
-    --border \
-    --prompt="sessions > " \
-    --pointer=">" \
-    --color="header:yellow,prompt:blue,pointer:green" \
-    --preview="bash '$SCRIPT_DIR/session-preview.sh' {1} '$HOME_KEY' {q}" \
-    --preview-window=right:40%:wrap)
 else
-  # No query: all sessions by recency, fzf does interactive search
-  selected=$(awk_format < "$UNIFIED_CACHE" | fzf \
-    --ansi \
-    --delimiter='\t' \
-    --with-nth=2 \
-    --exact \
-    -i \
-    --no-hscroll \
-    --tiebreak=index \
-    --header="$session_count sessions · ctrl-/ toggle preview" \
-    --bind="ctrl-/:toggle-preview" \
-    --height=80% \
-    --reverse \
-    --border \
-    --prompt="sessions > " \
-    --pointer=">" \
-    --color="header:yellow,prompt:blue,pointer:green" \
-    --preview="bash '$SCRIPT_DIR/session-preview.sh' {1} '$HOME_KEY' {q}" \
-    --preview-window=right:40%:wrap)
+  initial=$(python3 "$SCRIPT_DIR/session_indexer.py" --fzf --label "$CL")
 fi
+
+selected=$(echo "$initial" | fzf \
+  --ansi \
+  --delimiter='\t' \
+  --with-nth=2 \
+  --phony \
+  --query="$search_query" \
+  --no-hscroll \
+  --header="$session_count sessions · ctrl-/ toggle preview" \
+  --bind="ctrl-/:toggle-preview" \
+  --bind="change:reload(python3 '$SCRIPT_DIR/session_indexer.py' --fzf --label '$CL' --search {q} 2>/dev/null || true)" \
+  --height=80% \
+  --reverse \
+  --border \
+  --prompt="sessions > " \
+  --pointer=">" \
+  --color="header:yellow,prompt:blue,pointer:green" \
+  --preview="bash '$SCRIPT_DIR/session-preview.sh' {1} '$HOME_KEY' {q}" \
+  --preview-window=right:40%:wrap)
 
 if [[ -n "$selected" ]]; then
   session_id=$(echo "$selected" | cut -d$'\t' -f1)
