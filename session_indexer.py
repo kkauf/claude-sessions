@@ -321,14 +321,20 @@ def search(conn, query, limit=200):
         fts_query = ' OR '.join(tokens)
 
     # BM25 weights: title=10, preview=5, body=1
+    # Combined score: blend relevance with recency so recent sessions with
+    # moderate relevance beat old sessions with high relevance. BM25 returns
+    # negative scores (more negative = better match). The recency multiplier
+    # amplifies scores for recent sessions (> 1x) and decays toward 1x for
+    # old sessions, with a half-life of ~7 days.
     sql = """
         SELECT s.sid, s.title, s.preview, s.body, s.project,
                s.created_epoch, s.mtime_epoch,
-               bm25(sessions_fts, 10.0, 5.0, 1.0) as rank
+               bm25(sessions_fts, 10.0, 5.0, 1.0) as bm25_score
         FROM sessions s
         JOIN sessions_fts f ON s.rowid = f.rowid
         WHERE sessions_fts MATCH ?
-        ORDER BY rank, s.mtime_epoch DESC
+        ORDER BY
+            bm25_score * (1.0 + 2.0 / (1.0 + max(unixepoch('now') - s.mtime_epoch, 0) / 604800.0))
         LIMIT ?
     """
 
@@ -344,7 +350,7 @@ def search(conn, query, limit=200):
             return []
 
     results = []
-    for sid, title, preview, body, project, created, mtime, rank in rows:
+    for sid, title, preview, body, project, created, mtime, bm25_score in rows:
         if project_filter and project_filter not in project.lower():
             continue
         if exclude_terms:
@@ -355,7 +361,7 @@ def search(conn, query, limit=200):
             'sid': sid, 'title': title, 'preview': preview,
             'body': body, 'project': project,
             'created_epoch': created, 'mtime_epoch': mtime,
-            'rank': rank,
+            'rank': bm25_score,
         })
         if len(results) >= limit:
             break

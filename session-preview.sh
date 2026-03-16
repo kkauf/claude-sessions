@@ -69,6 +69,7 @@ jq_text='
      [.[] | select(.type == "text") | .text] | join(" ")
    else "" end) |
   select(length > 0) |
+  gsub("\n"; " ") |
   if $t == "user" then "[U] " + .[0:300]
   else "[A] " + .[0:300] end'
 
