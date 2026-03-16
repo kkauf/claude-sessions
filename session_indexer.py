@@ -310,6 +310,16 @@ def search(conn, query, limit=200):
     if not fts_query:
         return []
 
+    # Multi-word queries: use OR so any term matches (BM25 ranks multi-match higher).
+    # Without this, FTS5 defaults to AND — which fails when the user searches across
+    # sessions with loosely related terms (e.g., "supabase nano micro plan upgrade").
+    # Skip if query already contains FTS5 operators or quoted phrases.
+    _FTS5_OPS = {'OR', 'AND', 'NOT', 'NEAR'}
+    tokens = fts_query.split()
+    if ('"' not in fts_query and len(tokens) > 1
+            and not any(t.upper() in _FTS5_OPS for t in tokens)):
+        fts_query = ' OR '.join(tokens)
+
     # BM25 weights: title=10, preview=5, body=1
     sql = """
         SELECT s.sid, s.title, s.preview, s.body, s.project,
