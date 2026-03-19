@@ -190,6 +190,15 @@ class TestEdgeCases(SearchTestCase):
         results = self.all_sids('pre-commit')
         self.assertIn('a', results)
 
+    def test_dehyphenated_compound_matches(self):
+        """Searching without hyphen matches hyphenated terms via dehyphenation."""
+        # Note: dehyphenation happens at extraction time (_extract_one), not in
+        # index_session. This test verifies FTS5 would match if the joined form
+        # were present in the body (simulating what _extract_one produces).
+        self.add('a', body='Therapie-Kompass chatbot TherapieKompass')
+        results = self.all_sids('therapiekompass')
+        self.assertIn('a', results)
+
     def test_german_text(self):
         """unicode61 handles accents and umlauts."""
         self.add('a', body='Die Therapeutin hat die Zahlungseinrichtung abgeschlossen')

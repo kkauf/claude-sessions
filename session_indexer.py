@@ -260,7 +260,14 @@ def _extract_one(args):
     preview = preview.replace('\t', ' ').replace('\n', ' ')
 
     # Body: concatenated conversation text for full-text search
-    body = "\n".join(body_parts)[:10000]
+    # No length limit — per-message extraction (500/300 chars) is the real guard rail
+    body = "\n".join(body_parts)
+
+    # Append dehyphenated compounds so "therapiekompass" matches "Therapie-Kompass"
+    hyphenated = set(re.findall(r'\b(\w+-\w+(?:-\w+)*)\b', body))
+    if hyphenated:
+        joined = " ".join(w.replace("-", "") for w in hyphenated)
+        body = body + "\n" + joined
 
     # Extract creation timestamp from first line
     created_epoch = int(mtime)
