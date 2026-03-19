@@ -75,6 +75,7 @@ NOISE_PREFIXES = (
     "<local-command-caveat>",
     "Caveat: The messages below",
     "[Request interrupted",
+    "<system-reminder>",
 )
 
 
@@ -187,24 +188,27 @@ def _extract_one(args):
         return None
 
     first_user = second_user = custom_title = summary = None
-    user_count = 0
+    real_user_count = 0
     body_parts = []
 
     for m in MARKER_RE.finditer(data):
         tp = m.group(1)
 
         if tp == b'user':
-            user_count += 1
             line = _extract_line(data, m.start())
             text = _parse_msg_text(line)
-            if user_count == 1:
-                if not text:
-                    return None
-                first_user = ' '.join(text[:200].split())
-            elif user_count == 2 and text:
-                second_user = ' '.join(text[:200].split())
-            if text:
-                body_parts.append(text[:500])
+            if not text:
+                continue  # skip tool_result-only and empty user messages
+            clean = ' '.join(text[:200].split())
+            # Skip noise messages (system artifacts, interrupts)
+            is_noise = clean == "Warmup" or any(clean.startswith(p) for p in NOISE_PREFIXES)
+            if not is_noise:
+                real_user_count += 1
+                if real_user_count == 1:
+                    first_user = clean
+                elif real_user_count == 2:
+                    second_user = clean
+            body_parts.append(text[:500])
 
         elif tp == b'assistant':
             line = _extract_line(data, m.start())
@@ -236,13 +240,6 @@ def _extract_one(args):
     if not first_user:
         return None
 
-    # --- Filters ---
-    if first_user == "Warmup":
-        return None
-    for p in NOISE_PREFIXES:
-        if first_user.startswith(p):
-            return None
-
     preview = first_user
     if first_user.startswith("claude --resume"):
         preview = second_user if second_user else None
@@ -263,11 +260,15 @@ def _extract_one(args):
     # No length limit — per-message extraction (500/300 chars) is the real guard rail
     body = "\n".join(body_parts)
 
-    # Append dehyphenated compounds so "therapiekompass" matches "Therapie-Kompass"
-    hyphenated = set(re.findall(r'\b(\w+-\w+(?:-\w+)*)\b', body))
+    # Append dehyphenated compounds so "therapiekompass" matches "Therapie-Kompass".
+    # Preserve frequency: if "Therapie-Kompass" appears 10x, add "TherapieKompass" 10x.
+    from collections import Counter
+    hyphenated = Counter(re.findall(r'\b(\w+-\w+(?:-\w+)*)\b', body))
     if hyphenated:
-        joined = " ".join(w.replace("-", "") for w in hyphenated)
-        body = body + "\n" + joined
+        parts = []
+        for word, count in hyphenated.items():
+            parts.extend([word.replace("-", "")] * count)
+        body = body + "\n" + " ".join(parts)
 
     # Extract creation timestamp from first line
     created_epoch = int(mtime)
@@ -327,53 +328,77 @@ def search(conn, query, limit=200):
             and not any(t.upper() in _FTS5_OPS for t in tokens)):
         fts_query = ' OR '.join(tokens)
 
-    # BM25 weights: title=10, preview=5, body=1
-    # Combined score: blend relevance with recency so recent sessions with
-    # moderate relevance beat old sessions with high relevance. BM25 returns
-    # negative scores (more negative = better match). The recency multiplier
-    # amplifies scores for recent sessions (> 1x) and decays toward 1x for
-    # old sessions, with a half-life of ~7 days.
+    # Extract search terms for mention-count re-ranking
+    rank_terms = set()
+    for token in raw.strip().split():
+        t = token.strip('"').lower()
+        if t and t.upper() not in _FTS5_OPS and len(t) > 1:
+            rank_terms.add(t)
+            if '-' in t:
+                rank_terms.add(t.replace('-', ''))
+
+    # FTS5 for matching, fetch generously for Python re-ranking
     sql = """
         SELECT s.sid, s.title, s.preview, s.body, s.project,
-               s.created_epoch, s.mtime_epoch,
-               bm25(sessions_fts, 10.0, 5.0, 1.0) as bm25_score
+               s.created_epoch, s.mtime_epoch
         FROM sessions s
         JOIN sessions_fts f ON s.rowid = f.rowid
         WHERE sessions_fts MATCH ?
-        ORDER BY
-            bm25_score * (1.0 + 2.0 / (1.0 + max(unixepoch('now') - s.mtime_epoch, 0) / 604800.0))
         LIMIT ?
     """
 
     try:
-        rows = conn.execute(sql, (fts_query, limit * 2)).fetchall()
+        rows = conn.execute(sql, (fts_query, limit * 3)).fetchall()
     except sqlite3.OperationalError:
         safe = _sanitize_fts_query(fts_query)
         if not safe:
             return []
         try:
-            rows = conn.execute(sql, (safe, limit * 2)).fetchall()
+            rows = conn.execute(sql, (safe, limit * 3)).fetchall()
         except sqlite3.OperationalError:
             return []
 
+    # Post-filter, then re-rank by mention count × recency.
+    # BM25's document length normalization penalizes long sessions unfairly —
+    # a 73K session with 10 mentions is more relevant than a 12K session with 2.
+    import math
+    now = time.time()
     results = []
-    for sid, title, preview, body, project, created, mtime, bm25_score in rows:
+    for sid, title, preview, body, project, created, mtime in rows:
         if project_filter and project_filter not in project.lower():
             continue
         if exclude_terms:
             combined = f"{title} {preview} {body}".lower()
             if any(t in combined for t in exclude_terms):
                 continue
+
+        # Weighted mention count (title=10x, preview=5x, body=1x)
+        title_hits = _count_mentions(title or '', rank_terms)
+        preview_hits = _count_mentions(preview or '', rank_terms)
+        body_hits = _count_mentions(body or '', rank_terms)
+        weighted = title_hits * 10 + preview_hits * 5 + body_hits
+
+        # Recency boost: ~3x for today, ~2x for 1 week old, ~1.3x for 1 month
+        age_s = max(0, now - mtime)
+        recency = 1.0 + 2.0 / (1.0 + age_s / 604800.0)
+
+        score = math.log1p(weighted) * recency
+
         results.append({
             'sid': sid, 'title': title, 'preview': preview,
             'body': body, 'project': project,
             'created_epoch': created, 'mtime_epoch': mtime,
-            'rank': bm25_score,
+            'rank': score,
         })
-        if len(results) >= limit:
-            break
 
-    return results
+    results.sort(key=lambda r: -r['rank'])  # higher = better
+    return results[:limit]
+
+
+def _count_mentions(text, terms):
+    """Count total mentions of all terms in text (case-insensitive)."""
+    text_lower = text.lower()
+    return sum(text_lower.count(t) for t in terms)
 
 
 def _sanitize_fts_query(query):
