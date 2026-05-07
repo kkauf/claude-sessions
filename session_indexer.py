@@ -372,17 +372,38 @@ def search(conn, query, limit=200):
             if any(t in combined for t in exclude_terms):
                 continue
 
-        # Weighted mention count (title=10x, preview=5x, body=1x)
-        title_hits = _count_mentions(title or '', rank_terms)
-        preview_hits = _count_mentions(preview or '', rank_terms)
-        body_hits = _count_mentions(body or '', rank_terms)
-        weighted = title_hits * 10 + preview_hits * 5 + body_hits
+        # Per-term weighted mention count (title=10x, preview=5x, body=1x).
+        title_l = (title or '').lower()
+        preview_l = (preview or '').lower()
+        body_l = (body or '').lower()
+        per_term = {
+            t: title_l.count(t) * 10 + preview_l.count(t) * 5 + body_l.count(t)
+            for t in rank_terms
+        }
+
+        # Saturate each term's contribution (log1p) before summing. Prevents one
+        # very common word (e.g. "laura" mentioned 81x in a huge unrelated session)
+        # from drowning out a focused session where all query terms are present
+        # but each appears only a handful of times.
+        saturated = sum(math.log1p(h) for h in per_term.values())
+
+        # Coverage: fraction of query terms this session actually contains.
+        # Squared so a 3/3 match strongly beats a 2/3 "one term 50x" fluke.
+        distinct = sum(1 for h in per_term.values() if h > 0)
+        coverage = distinct / len(rank_terms) if rank_terms else 1.0
+
+        # Coherence bonus: if ALL query terms appear in title+preview (a short,
+        # ~200-char window), that's a strong signal the session is *about* those
+        # terms — not just a sprawling session where the terms happen to co-occur.
+        header = f"{title_l} {preview_l}"
+        header_distinct = sum(1 for t in rank_terms if t in header)
+        coherence = 2.0 if (rank_terms and header_distinct == len(rank_terms)) else 1.0
 
         # Recency boost: ~3x for today, ~2x for 1 week old, ~1.3x for 1 month
         age_s = max(0, now - mtime)
         recency = 1.0 + 2.0 / (1.0 + age_s / 604800.0)
 
-        score = math.log1p(weighted) * recency
+        score = saturated * recency * (coverage ** 2) * coherence
 
         results.append({
             'sid': sid, 'title': title, 'preview': preview,

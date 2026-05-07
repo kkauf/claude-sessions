@@ -124,6 +124,49 @@ class TestFrequency(SearchTestCase):
         self.assertEqual(results[0], 's1')
 
 
+class TestCoverage(SearchTestCase):
+    """Multi-term queries reward sessions that contain more distinct terms.
+
+    Regression: a huge session mentioning ONE query term 50x used to out-rank
+    smaller sessions that actually contained ALL query terms. Coverage² fixes that.
+    """
+
+    def test_all_terms_beat_one_term_many_times(self):
+        # Mimics the real case: "daily gdpr dpa" — 'daily' is a common word
+        # in a Daily.co-heavy session with 0 hits of gdpr/dpa.
+        huge_one_term = 'daily ' * 50 + 'video call split session bug'
+        all_three = 'daily gdpr dpa discussion about processor agreement'
+        self.add('huge', title='reduce-intro-no-shows', body=huge_one_term, mtime=2000)
+        self.add('small', title='', body=all_three, mtime=2000)
+        self.assertEqual(self.top('daily gdpr dpa'), ['small'])
+
+    def test_two_of_three_beats_one_of_three(self):
+        self.add('one', body='daily ' * 20)
+        self.add('two', body='daily gdpr compliance review')
+        self.assertEqual(self.top('daily gdpr dpa'), ['two'])
+
+    def test_single_term_query_unaffected(self):
+        """Coverage is always 1.0 for single-term queries — no behavior change."""
+        self.add('many', body='standup ' * 10)
+        self.add('few', body='standup once')
+        self.assertEqual(self.top('standup'), ['many'])
+
+    def test_focused_preview_beats_sprawling_body(self):
+        """Both sessions have full coverage, but target's preview contains BOTH
+        query terms — a strong 'this session is about X' signal. Regression case:
+        'Stripe Laura' used to surface a 175KB no-show session where Laura was
+        mentioned 81x in unrelated context and Stripe 4x, beating a focused
+        session whose preview was literally 'Laura enabled Stripe for her account'.
+        """
+        fat_body = ('laura ' * 81) + ('stripe ' * 4) + 'no-show therapist data'
+        self.add('fat', title='reduce-intro-no-shows', body=fat_body, mtime=2000)
+        self.add('focused',
+                 preview='Therapist Laura just enabled Stripe for her account',
+                 body='stripe payment flow. laura setup. stripe onboarding.',
+                 mtime=2000)
+        self.assertEqual(self.top('stripe laura'), ['focused'])
+
+
 class TestRecencyTiebreaker(SearchTestCase):
     """Among equally relevant results, newer sessions rank first."""
 

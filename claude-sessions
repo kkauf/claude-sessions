@@ -10,9 +10,107 @@ shopt -s nullglob
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLAUDE_PROJECTS="$HOME/.claude/projects"
 UNIFIED_CACHE="$HOME/.claude/.sessions-unified-cache.tsv"
+SNAPSHOT_FILE="$HOME/.claude/.session-snapshot.tsv"
 
 # Derive home directory key (how Claude Code encodes paths)
 HOME_KEY=$(echo "$HOME" | sed 's|/|-|g; s|^-||')
+
+# Resolve claude binary up-front (PATH may be missing /opt/homebrew/bin in non-login shells)
+CLAUDE_BIN="$(command -v claude || true)"
+[[ -z "$CLAUDE_BIN" && -x /opt/homebrew/bin/claude ]] && CLAUDE_BIN=/opt/homebrew/bin/claude
+
+# --- Save/Restore commands ---
+
+if [[ "${1:-}" == "save" ]]; then
+  > "$SNAPSHOT_FILE"
+
+  # Find sessions modified in the last 15 minutes (active/open sessions)
+  while IFS= read -r f; do
+    sid=$(basename "$f" .jsonl)
+    sid=$(basename "$f" .jsonl)
+    cwd=$(head -1 "$f" | jq -r '.cwd // empty' 2>/dev/null)
+    # Get session name/title from custom-title or first user message
+    title=$(grep -m1 '"custom-title"' "$f" 2>/dev/null | jq -r '.title // empty' 2>/dev/null)
+    if [[ -z "$title" ]]; then
+      title=$(grep -m1 '"user"' "$f" 2>/dev/null | jq -r '
+        if .message.content | type == "array" then
+          [.message.content[] | select(.type == "text") | .text] | join(" ")
+        elif .message.content | type == "string" then
+          .message.content
+        else ""
+        end' 2>/dev/null | head -c 80)
+    fi
+    [[ -z "$cwd" ]] && continue
+    printf '%s\t%s\t%s\n' "$sid" "$cwd" "$title" >> "$SNAPSHOT_FILE"
+  done < <(find "$CLAUDE_PROJECTS" -name '*.jsonl' -not -name 'agent-*' -maxdepth 2 -mmin -15 2>/dev/null)
+
+  n=$(wc -l < "$SNAPSHOT_FILE" | tr -d ' ')
+
+  # Build summary for notification
+  summary=""
+  while IFS=$'\t' read -r sid cwd title; do
+    dir=$(basename "$cwd")
+    summary+="  $dir — ${title:0:60}"$'\n'
+  done < "$SNAPSHOT_FILE"
+
+  echo "Saved $n active sessions."
+  [[ -n "$summary" ]] && echo "$summary"
+
+  # macOS notification
+  osascript -e "display notification \"$n active sessions saved. Restore with: claude-sessions restore\" with title \"Claude Sessions\" sound name \"Pop\"" 2>/dev/null
+
+  exit 0
+fi
+
+if [[ "${1:-}" == "restore" ]]; then
+  if [[ ! -f "$SNAPSHOT_FILE" ]]; then
+    echo "No snapshot found. Run 'claude-sessions save' first." >&2
+    exit 1
+  fi
+
+  n=$(wc -l < "$SNAPSHOT_FILE" | tr -d ' ')
+  echo "Restoring $n sessions..."
+  echo ""
+
+  while IFS=$'\t' read -r sid cwd title; do
+    dir=$(basename "$cwd")
+    echo "  Opening: $dir — ${title:0:60}"
+
+    if [[ -d "$cwd" ]]; then
+      # Open a new iTerm2 tab and resume the session
+      osascript -e "
+        tell application \"iTerm2\"
+          tell current window
+            create tab with default profile
+            tell current session
+              write text \"cd '$cwd' && claude --resume '$sid'\"
+            end tell
+          end tell
+        end tell
+      " 2>/dev/null
+    else
+      echo "    (skipped — directory $cwd not found)"
+    fi
+  done < "$SNAPSHOT_FILE"
+
+  echo ""
+  echo "Done. All sessions restored in new tabs."
+  exit 0
+fi
+
+if [[ "${1:-}" == "snapshot" ]]; then
+  # Show current snapshot without restoring
+  if [[ ! -f "$SNAPSHOT_FILE" ]]; then
+    echo "No snapshot saved." >&2
+    exit 1
+  fi
+  echo "Saved snapshot:"
+  while IFS=$'\t' read -r sid cwd title; do
+    dir=$(basename "$cwd")
+    echo "  $dir — ${title:0:60}"
+  done < "$SNAPSHOT_FILE"
+  exit 0
+fi
 
 for cmd in fzf jq python3; do
   command -v "$cmd" &>/dev/null || { echo "$cmd required. Install: brew install $cmd (macOS) or apt install $cmd (Linux)" >&2; exit 1; }
@@ -98,8 +196,15 @@ if [[ -n "$selected" ]]; then
   session_cwd=""
   shopt -s nullglob
   session_files=("$CLAUDE_PROJECTS"/*/${session_id}.jsonl)
-  if [[ ${#session_files[@]} -gt 0 && -f "${session_files[0]}" ]]; then
-    session_cwd=$(grep -m1 '"cwd"' "${session_files[0]}" \
+  if [[ ${#session_files[@]} -gt 1 ]]; then
+    session_file=$(ls -S "${session_files[@]}" 2>/dev/null | head -1)
+  elif [[ ${#session_files[@]} -eq 1 ]]; then
+    session_file="${session_files[0]}"
+  else
+    session_file=""
+  fi
+  if [[ -n "$session_file" && -f "$session_file" ]]; then
+    session_cwd=$(grep -m1 '"cwd"' "$session_file" \
       | jq -r '.cwd // empty' 2>/dev/null)
   fi
 
@@ -107,5 +212,9 @@ if [[ -n "$selected" ]]; then
     cd "$session_cwd"
   fi
 
-  exec claude --resume "$session_id"
+  if [[ -z "$CLAUDE_BIN" ]]; then
+    echo "claude-sessions: 'claude' not found in PATH" >&2
+    exit 1
+  fi
+  exec "$CLAUDE_BIN" --resume "$session_id"
 fi

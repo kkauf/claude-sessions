@@ -10,7 +10,13 @@ query="$3"
 # Support override for testing
 projects_dir="${SESSION_PROJECTS_DIR:-$HOME/.claude/projects}"
 files=("$projects_dir"/*/${sid}.jsonl)
-f="${files[0]}"
+if [[ ${#files[@]} -gt 1 ]]; then
+  # Multiple project dirs have this session (e.g. main + worktree ghost).
+  # Pick the largest file — the real session, not the empty stub.
+  f=$(ls -S "${files[@]}" 2>/dev/null | head -1)
+else
+  f="${files[0]}"
+fi
 
 if [[ -z "$f" || ! -f "$f" ]]; then
   echo "Session file not found"
