@@ -117,13 +117,13 @@ def _extract_line(data, pos):
 def _extract_text(content):
     """Extract text from message content (string or array format)."""
     if isinstance(content, str):
-        return content[:500]
+        return content[:2000]
     if isinstance(content, list):
         parts = []
         for b in content:
             if isinstance(b, dict) and b.get("type") == "text":
-                parts.append(b.get("text", "")[:500])
-        return " ".join(parts)[:500]
+                parts.append(b.get("text", "")[:2000])
+        return " ".join(parts)[:2000]
     return ""
 
 
@@ -154,7 +154,7 @@ def _extract_gems(line):
         return None
     content = msg.get("content", "")
     if isinstance(content, str):
-        return content[:300]
+        return content[:1500]
     if isinstance(content, list):
         text_blocks = []
         for b in content:
@@ -165,8 +165,8 @@ def _extract_gems(line):
         if not text_blocks:
             return None
         if len(text_blocks) == 1:
-            return text_blocks[0][:300]
-        return text_blocks[0][:200] + " " + text_blocks[-1][:200]
+            return text_blocks[0][:1500]
+        return text_blocks[0][:1000] + " " + text_blocks[-1][:1000]
     return None
 
 
@@ -208,7 +208,7 @@ def _extract_one(args):
                     first_user = clean
                 elif real_user_count == 2:
                     second_user = clean
-            body_parts.append(text[:500])
+            body_parts.append(text[:2000])
 
         elif tp == b'assistant':
             line = _extract_line(data, m.start())
@@ -216,7 +216,7 @@ def _extract_one(args):
                 continue
             gems = _extract_gems(line)
             if gems:
-                body_parts.append(gems[:300])
+                body_parts.append(gems[:1500])
 
         elif tp == b'summary':
             line = _extract_line(data, m.start())
