@@ -78,6 +78,28 @@ NOISE_PREFIXES = (
     "<system-reminder>",
 )
 
+# Machine-spawned sessions the user never resumes by hand (code-review/security
+# runs, automated probes, bare slash-command artifacts, alert crons). They're
+# still indexed and findable via explicit search, but hidden from the default
+# recency listing so real work isn't buried. Set SESSIONS_INCLUDE_AUTOMATED=1
+# to show them. Matched case-sensitively against the session preview.
+AUTOMATED_PREVIEW_PATTERNS = (
+    "Review this change for security",   # /code-review, /security-review
+    "Reply with only:",                  # automated probes / keepalives
+    "<command-name>",                    # bare slash-command artifact sessions
+    "Window: last 15 minutes",           # alert-digest cron
+    "⚠️ WARNING",              # user-facing-errors alert sessions
+)
+
+
+def is_automated(preview):
+    """True if the session is machine-spawned (hidden from default view)."""
+    p = preview or ""
+    return any(p.startswith(prefix) for prefix in AUTOMATED_PREVIEW_PATTERNS)
+
+
+SHOW_AUTOMATED = os.environ.get("SESSIONS_INCLUDE_AUTOMATED") == "1"
+
 
 # --- Database ---
 
@@ -524,12 +546,16 @@ def write_cache(conn, cache_path=None):
 
     path = cache_path or CACHE_PATH
     tmp = path + ".tmp"
+    written = 0
     with open(tmp, 'w') as f:
         for sid, title, preview, body, project, created, mtime in rows:
+            if not SHOW_AUTOMATED and is_automated(preview):
+                continue
             excerpt = ' '.join(body.split())[:600]
             f.write(f"{sid}\t{title}\t{preview}\t{excerpt}\t{created}\t{mtime}\t{project}\n")
+            written += 1
     os.replace(tmp, path)
-    return len(rows)
+    return written
 
 
 # --- fzf output formatting ---
@@ -560,7 +586,8 @@ def _reldate(epoch):
 
 def format_fzf_line(sid, title, preview, body, project, created_epoch, mtime_epoch, current_label=''):
     """Format a session as fzf-ready line: SID\\tDISPLAY+PAD+SEARCH."""
-    rd = _reldate(created_epoch)
+    # Show last-activity date (matches the mtime_epoch DESC sort), not start date.
+    rd = _reldate(mtime_epoch)
 
     # Project tag (only for other projects)
     tag = ""
@@ -596,6 +623,8 @@ def fzf_output(conn, query='', current_label=''):
             FROM sessions ORDER BY mtime_epoch DESC
         """).fetchall()
         for row in rows:
+            if not SHOW_AUTOMATED and is_automated(row[2]):
+                continue
             print(format_fzf_line(*row, current_label=current_label))
 
 
