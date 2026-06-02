@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     body TEXT DEFAULT '',
     project TEXT DEFAULT '',
     created_epoch INTEGER DEFAULT 0,
-    mtime_epoch INTEGER DEFAULT 0
+    mtime_epoch INTEGER DEFAULT 0,
+    size_bytes INTEGER DEFAULT 0
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
@@ -111,19 +112,23 @@ def init_db(db_path=None):
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(SCHEMA)
+    # Migrate older DBs that predate size_bytes.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
+    if "size_bytes" not in cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN size_bytes INTEGER DEFAULT 0")
     return conn
 
 
-def index_session(conn, sid, title, preview, body, project, created_epoch, mtime_epoch):
+def index_session(conn, sid, title, preview, body, project, created_epoch, mtime_epoch, size_bytes=0):
     """Insert or update a session in the database."""
     conn.execute("""
-        INSERT INTO sessions (sid, title, preview, body, project, created_epoch, mtime_epoch)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO sessions (sid, title, preview, body, project, created_epoch, mtime_epoch, size_bytes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(sid) DO UPDATE SET
             title=excluded.title, preview=excluded.preview, body=excluded.body,
             project=excluded.project, created_epoch=excluded.created_epoch,
-            mtime_epoch=excluded.mtime_epoch
-    """, (sid, title, preview, body, project, created_epoch, mtime_epoch))
+            mtime_epoch=excluded.mtime_epoch, size_bytes=excluded.size_bytes
+    """, (sid, title, preview, body, project, created_epoch, mtime_epoch, size_bytes))
 
 
 # --- Text extraction (from JSONL) ---
@@ -306,7 +311,7 @@ def _extract_one(args):
         except (ValueError, OSError):
             pass
 
-    return (mtime, sid, title, preview, body, created_epoch, int(mtime), label)
+    return (mtime, sid, title, preview, body, created_epoch, int(mtime), label, size)
 
 
 # --- Search ---
@@ -364,7 +369,7 @@ def search(conn, query, limit=200):
     # FTS5 for matching, fetch generously for Python re-ranking
     sql = """
         SELECT s.sid, s.title, s.preview, s.body, s.project,
-               s.created_epoch, s.mtime_epoch
+               s.created_epoch, s.mtime_epoch, s.size_bytes
         FROM sessions s
         JOIN sessions_fts f ON s.rowid = f.rowid
         WHERE sessions_fts MATCH ?
@@ -388,7 +393,7 @@ def search(conn, query, limit=200):
     import math
     now = time.time()
     results = []
-    for sid, title, preview, body, project, created, mtime in rows:
+    for sid, title, preview, body, project, created, mtime, size_bytes in rows:
         if project_filter and project_filter not in project.lower():
             continue
         if exclude_terms:
@@ -433,7 +438,7 @@ def search(conn, query, limit=200):
             'sid': sid, 'title': title, 'preview': preview,
             'body': body, 'project': project,
             'created_epoch': created, 'mtime_epoch': mtime,
-            'rank': score,
+            'size_bytes': size_bytes, 'rank': score,
         })
 
     results.sort(key=lambda r: -r['rank'])  # higher = better
@@ -485,8 +490,14 @@ def sync_db(conn, files, force_rebuild=False):
             "SELECT sid, mtime_epoch FROM sessions"
         ).fetchall())
 
-    file_map = {sid: (path, sid, size, mtime, label)
-                for path, sid, size, mtime, label in files}
+    # A session id can exist in multiple project dirs (e.g. a tiny worktree
+    # stub + the real file in the main repo). Keep the largest so the picker
+    # never indexes a 146-byte stub over a 28MB session.
+    file_map = {}
+    for path, sid, size, mtime, label in files:
+        prev = file_map.get(sid)
+        if prev is None or size > prev[2]:
+            file_map[sid] = (path, sid, size, mtime, label)
 
     # Remove deleted sessions
     removed = 0
@@ -515,8 +526,8 @@ def sync_db(conn, files, force_rebuild=False):
     added = 0
     for r in results:
         if r:
-            _, sid, title, preview, body, created, mtime_ep, label = r
-            index_session(conn, sid, title, preview, body, label, created, mtime_ep)
+            _, sid, title, preview, body, created, mtime_ep, label, size = r
+            index_session(conn, sid, title, preview, body, label, created, mtime_ep, size)
             added += 1
 
     conn.commit()
@@ -586,22 +597,36 @@ def _reldate(epoch):
     return f"{d // 365:2d}y  "
 
 
-def format_fzf_line(sid, title, preview, body, project, created_epoch, mtime_epoch, current_label=''):
+def _humansize(n):
+    """Compact size label for the picker (file bytes \u2192 '29M', '686k', '')."""
+    if not n:
+        return ""
+    if n >= 1_000_000:
+        return f"{round(n / 1_000_000)}M"
+    if n >= 10_000:
+        return f"{round(n / 1_000)}k"
+    return ""  # sub-10k stubs read as blank \u2014 nothing worth resuming
+
+
+def format_fzf_line(sid, title, preview, body, project, created_epoch, mtime_epoch, size_bytes=0, current_label=''):
     """Format a session as fzf-ready line: SID\\tDISPLAY+PAD+SEARCH."""
     # Show last-activity date (matches the mtime_epoch DESC sort), not start date.
     rd = _reldate(mtime_epoch)
+    # Size column \u2014 disambiguates sessions that share a preview (e.g. a 29M build
+    # session vs a 113-message earlier run of the same opening prompt).
+    sz = _humansize(size_bytes)
 
     # Project tag (only for other projects)
     tag = ""
     if project and project != current_label:
         tag = f"  \033[2m\u00b7 {project}\033[0m"
 
-    # Display: date + title or preview + optional project tag
+    # Display: date + size + title or preview + optional project tag
     if title:
-        display = f"\033[33m{rd:<5}\033[0m \033[1m{title}\033[0m{tag}"
+        display = f"\033[33m{rd:<5}\033[0m \033[2m{sz:>4}\033[0m \033[1m{title}\033[0m{tag}"
     else:
         p = (preview[:77] + "...") if len(preview) > 80 else preview
-        display = f"\033[33m{rd:<5}\033[0m {p}{tag}"
+        display = f"\033[33m{rd:<5}\033[0m \033[2m{sz:>4}\033[0m {p}{tag}"
 
     # Search text (pushed off-screen by padding)
     excerpt = ' '.join((body or '').split())[:300]
@@ -617,11 +642,12 @@ def fzf_output(conn, query='', current_label=''):
         for r in results:
             print(format_fzf_line(
                 r['sid'], r['title'], r['preview'], r['body'],
-                r['project'], r['created_epoch'], r['mtime_epoch'], current_label
+                r['project'], r['created_epoch'], r['mtime_epoch'], r['size_bytes'],
+                current_label=current_label
             ))
     else:
         rows = conn.execute("""
-            SELECT sid, title, preview, body, project, created_epoch, mtime_epoch
+            SELECT sid, title, preview, body, project, created_epoch, mtime_epoch, size_bytes
             FROM sessions ORDER BY mtime_epoch DESC
         """).fetchall()
         for row in rows:
