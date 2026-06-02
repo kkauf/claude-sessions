@@ -76,6 +76,9 @@ NOISE_PREFIXES = (
     "Caveat: The messages below",
     "[Request interrupted",
     "<system-reminder>",
+    "<command-name>",        # slash-command invocation (e.g. /effort)
+    "<local-command-stdout>",  # its stdout echo — skip both so the preview
+    "<local-command-stderr>",  # falls through to the real first message
 )
 
 # Machine-spawned sessions the user never resumes by hand (code-review/security
@@ -86,7 +89,6 @@ NOISE_PREFIXES = (
 AUTOMATED_PREVIEW_PATTERNS = (
     "Review this change for security",   # /code-review, /security-review
     "Reply with only:",                  # automated probes / keepalives
-    "<command-name>",                    # bare slash-command artifact sessions
     "Window: last 15 minutes",           # alert-digest cron
     "⚠️ WARNING",              # user-facing-errors alert sessions
 )
