@@ -15,9 +15,18 @@ SNAPSHOT_FILE="$HOME/.claude/.session-snapshot.tsv"
 # Derive home directory key (how Claude Code encodes paths)
 HOME_KEY=$(echo "$HOME" | sed 's|/|-|g; s|^-||')
 
-# Resolve claude binary up-front (PATH may be missing /opt/homebrew/bin in non-login shells)
+# Resolve the claude binary up-front. claude-sessions runs as bash, usually
+# spawned from an interactive zsh; the binary may live in any of several
+# install locations (homebrew/npm, native installer) and the inherited PATH
+# may be missing some of them in non-login shells.
 CLAUDE_BIN="$(command -v claude || true)"
-[[ -z "$CLAUDE_BIN" && -x /opt/homebrew/bin/claude ]] && CLAUDE_BIN=/opt/homebrew/bin/claude
+if [[ -z "$CLAUDE_BIN" ]]; then
+  for candidate in \
+    "$HOME/.claude/local/claude" "$HOME/.local/bin/claude" \
+    /opt/homebrew/bin/claude /usr/local/bin/claude; do
+    [[ -x "$candidate" ]] && { CLAUDE_BIN="$candidate"; break; }
+  done
+fi
 
 # --- Save/Restore commands ---
 
@@ -212,8 +221,17 @@ if [[ -n "$selected" ]]; then
     cd "$session_cwd"
   fi
 
+  # Last resort: ask the user's login shell, which is where 'claude' is known
+  # to resolve (custom PATH, or an install location the candidates above miss).
+  # Accept only an absolute path to an executable — reject alias/function defs.
   if [[ -z "$CLAUDE_BIN" ]]; then
-    echo "claude-sessions: 'claude' not found in PATH" >&2
+    resolved="$("${SHELL:-/bin/zsh}" -lic 'command -v claude' 2>/dev/null | tail -n1)"
+    [[ "$resolved" == /* && -x "$resolved" ]] && CLAUDE_BIN="$resolved"
+  fi
+  if [[ -z "$CLAUDE_BIN" ]]; then
+    echo "claude-sessions: could not locate the 'claude' binary." >&2
+    echo "  Looked in PATH, ~/.claude/local, ~/.local/bin, /opt/homebrew/bin, /usr/local/bin, and \$SHELL." >&2
+    echo "  Install Claude Code or add it to your PATH, then retry." >&2
     exit 1
   fi
   exec "$CLAUDE_BIN" --resume "$session_id"
