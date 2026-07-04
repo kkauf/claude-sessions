@@ -199,10 +199,13 @@ selected=$(echo "$initial" | fzf \
 if [[ -n "$selected" ]]; then
   session_id=$(echo "$selected" | cut -d$'\t' -f1)
 
-  # Find the session file and extract its original working directory.
-  # claude --resume scopes to the current project, so we must cd to the
-  # directory the session was created in.
-  session_cwd=""
+  # Find the session file. claude --resume only finds sessions whose
+  # transcript lives in the project folder derived from the CURRENT working
+  # directory, so we must cd to the directory that encodes to the folder the
+  # file actually lives in — not just any cwd recorded in the transcript
+  # (a session that entered a git worktree mid-run is re-homed to the
+  # worktree's project folder while its early cwd entries still point at the
+  # main repo).
   shopt -s nullglob
   session_files=("$CLAUDE_PROJECTS"/*/${session_id}.jsonl)
   if [[ ${#session_files[@]} -gt 1 ]]; then
@@ -212,13 +215,59 @@ if [[ -n "$selected" ]]; then
   else
     session_file=""
   fi
-  if [[ -n "$session_file" && -f "$session_file" ]]; then
-    session_cwd=$(grep -m1 '"cwd"' "$session_file" \
-      | jq -r '.cwd // empty' 2>/dev/null)
-  fi
 
-  if [[ -n "$session_cwd" && -d "$session_cwd" ]]; then
-    cd "$session_cwd"
+  if [[ -n "$session_file" && -f "$session_file" ]]; then
+    proj_key=$(basename "$(dirname "$session_file")")
+
+    # Distinct cwds recorded in the transcript, in order of first appearance.
+    cwds=()
+    while IFS= read -r c; do cwds+=("$c"); done < <(
+      jq -r '.cwd // empty' "$session_file" 2>/dev/null | awk 'NF && !seen[$0]++')
+
+    # Preferred: the cwd that encodes to the file's own project folder.
+    home_cwd=""
+    for c in "${cwds[@]}"; do
+      if [[ "$(echo "$c" | sed 's|[/.]|-|g')" == "$proj_key" ]]; then
+        home_cwd="$c"
+        break
+      fi
+    done
+
+    if [[ -n "$home_cwd" && -d "$home_cwd" ]]; then
+      cd "$home_cwd"
+    else
+      # The directory the file is keyed to no longer exists (e.g. a cleaned-up
+      # git worktree). Fall back to another surviving cwd from the transcript,
+      # or the nearest surviving ancestor, and relocate the transcript into
+      # that directory's project folder so claude --resume can find it.
+      target=""
+      for c in "${cwds[@]}"; do
+        [[ -d "$c" ]] && { target="$c"; break; }
+      done
+      if [[ -z "$target" && ${#cwds[@]} -gt 0 ]]; then
+        target="${cwds[0]}"
+        while [[ -n "$target" && "$target" != "/" && ! -d "$target" ]]; do
+          target="${target%/*}"
+        done
+        # Don't land inside .claude scaffolding (worktree parents).
+        while [[ "$target" == */.claude || "$target" == */.claude/* ]]; do
+          target="${target%/*}"
+        done
+      fi
+      if [[ -z "$target" || "$target" == "/" || ! -d "$target" ]]; then
+        echo "claude-sessions: the session's directory no longer exists and no fallback was found." >&2
+        exit 1
+      fi
+      target_key=$(echo "$target" | sed 's|[/.]|-|g')
+      if [[ "$target_key" != "$proj_key" ]]; then
+        mkdir -p "$CLAUDE_PROJECTS/$target_key"
+        if [[ ! -e "$CLAUDE_PROJECTS/$target_key/$(basename "$session_file")" ]]; then
+          mv "$session_file" "$CLAUDE_PROJECTS/$target_key/"
+        fi
+        echo "claude-sessions: session's original directory is gone; relocated it to resume from $target" >&2
+      fi
+      cd "$target"
+    fi
   fi
 
   # Last resort: ask the user's login shell, which is where 'claude' is known
