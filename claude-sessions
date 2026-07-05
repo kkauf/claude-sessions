@@ -127,6 +127,14 @@ done
 
 # --- Helpers ---
 
+# Encode an absolute path the way Claude Code derives project folder names:
+# every non-alphanumeric character becomes '-'. (Older versions preserved
+# spaces and '~'; matching on the modern scheme also migrates those legacy
+# sessions when they're picked.)
+encode_path() {
+  echo "$1" | sed 's|[^a-zA-Z0-9]|-|g'
+}
+
 project_label() {
   local s="${1#-${HOME_KEY}-}"
   s="${s#github-}"
@@ -227,7 +235,7 @@ if [[ -n "$selected" ]]; then
     # Preferred: the cwd that encodes to the file's own project folder.
     home_cwd=""
     for c in "${cwds[@]}"; do
-      if [[ "$(echo "$c" | sed 's|[/.]|-|g')" == "$proj_key" ]]; then
+      if [[ "$(encode_path "$c")" == "$proj_key" ]]; then
         home_cwd="$c"
         break
       fi
@@ -258,7 +266,7 @@ if [[ -n "$selected" ]]; then
         echo "claude-sessions: the session's directory no longer exists and no fallback was found." >&2
         exit 1
       fi
-      target_key=$(echo "$target" | sed 's|[/.]|-|g')
+      target_key=$(encode_path "$target")
       if [[ "$target_key" != "$proj_key" ]]; then
         mkdir -p "$CLAUDE_PROJECTS/$target_key"
         if [[ ! -e "$CLAUDE_PROJECTS/$target_key/$(basename "$session_file")" ]]; then
