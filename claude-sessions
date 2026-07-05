@@ -149,6 +149,91 @@ current_label() {
   project_label "$(basename "$(echo "$PWD" | sed 's|/|-|g; s|^-||')")"
 }
 
+# Resolve the directory to resume a session from, relocating the transcript
+# if needed. claude --resume only finds transcripts inside the project folder
+# derived from the CURRENT working directory, so the invariant we must
+# establish is: encode_path(resume dir) == the folder the transcript lives in.
+#
+# Wrinkles this handles:
+#   - A session that entered a git worktree mid-run is re-homed to the
+#     worktree's project folder while early cwd entries still point at the
+#     main repo — so we can't just cd to the first recorded cwd.
+#   - The worktree (or any session dir) may have been deleted since; then we
+#     fall back to another surviving cwd from the transcript, or the nearest
+#     surviving ancestor, and MOVE the transcript into that dir's folder.
+#   - Transcripts stranded under legacy folder encodings (old Claude Code
+#     preserved spaces/'~') get migrated to the modern name when picked.
+#
+# Prints the resume directory on stdout; returns 1 if none can be found.
+resolve_resume_dir() {
+  local session_id="$1"
+  local session_file="" proj_key="" target="" c
+
+  local files=("$CLAUDE_PROJECTS"/*/"${session_id}".jsonl)
+  if [[ ${#files[@]} -gt 1 ]]; then
+    session_file=$(ls -S "${files[@]}" 2>/dev/null | head -1)
+  elif [[ ${#files[@]} -eq 1 ]]; then
+    session_file="${files[0]}"
+  fi
+  # No transcript found (stale index?) — stay where we are and let claude
+  # report it; nothing to relocate.
+  [[ -z "$session_file" || ! -f "$session_file" ]] && { echo "$PWD"; return 0; }
+
+  proj_key=$(basename "$(dirname "$session_file")")
+
+  # Distinct cwds recorded in the transcript, in order of first appearance.
+  local cwds=()
+  while IFS= read -r c; do cwds+=("$c"); done < <(
+    jq -r '.cwd // empty' "$session_file" 2>/dev/null | awk 'NF && !seen[$0]++')
+
+  # Best case: a still-existing cwd that encodes to the transcript's own
+  # folder — cd there, no relocation needed.
+  for c in "${cwds[@]}"; do
+    if [[ -d "$c" && "$(encode_path "$c")" == "$proj_key" ]]; then
+      echo "$c"
+      return 0
+    fi
+  done
+
+  # Otherwise: pick a surviving cwd (first-appearance order puts the launch
+  # directory first), or climb to the nearest surviving ancestor.
+  for c in "${cwds[@]}"; do
+    [[ -d "$c" ]] && { target="$c"; break; }
+  done
+  if [[ -z "$target" && ${#cwds[@]} -gt 0 ]]; then
+    target="${cwds[0]}"
+    while [[ -n "$target" && "$target" != "/" && ! -d "$target" ]]; do
+      target="${target%/*}"
+    done
+    # Don't land inside .claude scaffolding (worktree parents).
+    while [[ "$target" == */.claude || "$target" == */.claude/* ]]; do
+      target="${target%/*}"
+    done
+  fi
+  if [[ -z "$target" || "$target" == "/" || ! -d "$target" ]]; then
+    return 1
+  fi
+
+  # Relocate the transcript into the target's project folder so claude can
+  # see it from there.
+  local target_key
+  target_key=$(encode_path "$target")
+  if [[ "$target_key" != "$proj_key" ]]; then
+    mkdir -p "$CLAUDE_PROJECTS/$target_key"
+    if [[ ! -e "$CLAUDE_PROJECTS/$target_key/$(basename "$session_file")" ]]; then
+      mv "$session_file" "$CLAUDE_PROJECTS/$target_key/"
+      echo "claude-sessions: relocated session transcript to resume from $target" >&2
+    fi
+  fi
+  echo "$target"
+}
+
+# Test hook: when sourced with CLAUDE_SESSIONS_LIB=1, expose the helpers and
+# stop before any indexing/UI work (see test_resume_resolution.sh).
+if [[ -n "${CLAUDE_SESSIONS_LIB:-}" ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 # --- Build/update cache (Python indexer — 40-70x faster than bash) ---
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}")")" && pwd)"
 python3 "$SCRIPT_DIR/session_indexer.py" || { echo "Indexer failed" >&2; exit 1; }
@@ -207,74 +292,28 @@ selected=$(echo "$initial" | fzf \
 if [[ -n "$selected" ]]; then
   session_id=$(echo "$selected" | cut -d$'\t' -f1)
 
-  # Find the session file. claude --resume only finds sessions whose
-  # transcript lives in the project folder derived from the CURRENT working
-  # directory, so we must cd to the directory that encodes to the folder the
-  # file actually lives in — not just any cwd recorded in the transcript
-  # (a session that entered a git worktree mid-run is re-homed to the
-  # worktree's project folder while its early cwd entries still point at the
-  # main repo).
-  shopt -s nullglob
-  session_files=("$CLAUDE_PROJECTS"/*/${session_id}.jsonl)
-  if [[ ${#session_files[@]} -gt 1 ]]; then
-    session_file=$(ls -S "${session_files[@]}" 2>/dev/null | head -1)
-  elif [[ ${#session_files[@]} -eq 1 ]]; then
-    session_file="${session_files[0]}"
-  else
-    session_file=""
+  if ! resume_dir=$(resolve_resume_dir "$session_id"); then
+    echo "claude-sessions: the session's directory no longer exists and no fallback was found." >&2
+    exit 1
   fi
+  cd "$resume_dir"
 
-  if [[ -n "$session_file" && -f "$session_file" ]]; then
-    proj_key=$(basename "$(dirname "$session_file")")
-
-    # Distinct cwds recorded in the transcript, in order of first appearance.
-    cwds=()
-    while IFS= read -r c; do cwds+=("$c"); done < <(
-      jq -r '.cwd // empty' "$session_file" 2>/dev/null | awk 'NF && !seen[$0]++')
-
-    # Preferred: the cwd that encodes to the file's own project folder.
-    home_cwd=""
-    for c in "${cwds[@]}"; do
-      if [[ "$(encode_path "$c")" == "$proj_key" ]]; then
-        home_cwd="$c"
-        break
-      fi
-    done
-
-    if [[ -n "$home_cwd" && -d "$home_cwd" ]]; then
-      cd "$home_cwd"
+  # Final invariant: claude --resume, started here, will look for the
+  # transcript at exactly this path. If it isn't there, resume WILL fail with
+  # 'No conversation found' — self-repair by moving it into place, and say so
+  # loudly if even that isn't possible.
+  expected="$CLAUDE_PROJECTS/$(encode_path "$PWD")/${session_id}.jsonl"
+  if [[ ! -f "$expected" ]]; then
+    stray=("$CLAUDE_PROJECTS"/*/"${session_id}".jsonl)
+    if [[ ${#stray[@]} -ge 1 && -f "${stray[0]}" ]]; then
+      mkdir -p "$(dirname "$expected")"
+      mv "${stray[0]}" "$expected"
+      echo "claude-sessions: transcript was not where claude expects it; moved it to:" >&2
+      echo "  $expected" >&2
     else
-      # The directory the file is keyed to no longer exists (e.g. a cleaned-up
-      # git worktree). Fall back to another surviving cwd from the transcript,
-      # or the nearest surviving ancestor, and relocate the transcript into
-      # that directory's project folder so claude --resume can find it.
-      target=""
-      for c in "${cwds[@]}"; do
-        [[ -d "$c" ]] && { target="$c"; break; }
-      done
-      if [[ -z "$target" && ${#cwds[@]} -gt 0 ]]; then
-        target="${cwds[0]}"
-        while [[ -n "$target" && "$target" != "/" && ! -d "$target" ]]; do
-          target="${target%/*}"
-        done
-        # Don't land inside .claude scaffolding (worktree parents).
-        while [[ "$target" == */.claude || "$target" == */.claude/* ]]; do
-          target="${target%/*}"
-        done
-      fi
-      if [[ -z "$target" || "$target" == "/" || ! -d "$target" ]]; then
-        echo "claude-sessions: the session's directory no longer exists and no fallback was found." >&2
-        exit 1
-      fi
-      target_key=$(encode_path "$target")
-      if [[ "$target_key" != "$proj_key" ]]; then
-        mkdir -p "$CLAUDE_PROJECTS/$target_key"
-        if [[ ! -e "$CLAUDE_PROJECTS/$target_key/$(basename "$session_file")" ]]; then
-          mv "$session_file" "$CLAUDE_PROJECTS/$target_key/"
-        fi
-        echo "claude-sessions: session's original directory is gone; relocated it to resume from $target" >&2
-      fi
-      cd "$target"
+      echo "claude-sessions: WARNING — no transcript found for $session_id anywhere under" >&2
+      echo "  $CLAUDE_PROJECTS; claude will report 'No conversation found'." >&2
+      echo "  The picker index may be stale (deleted session?)." >&2
     fi
   fi
 
