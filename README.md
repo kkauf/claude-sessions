@@ -18,7 +18,7 @@ Fast session picker for [Claude Code](https://docs.anthropic.com/en/docs/claude-
 - **Cross-project** — searches all projects, shows project labels for context
 - **Relative dates** — "today", "1d", "2w", "3mo" — based on the last *message* timestamp, not file mtime (Claude Code touches session files on mere open, which would resurrect dead sessions)
 - **Compact-fork aware** — when compaction continues a conversation under a new session id, the chain (id1 → id2 → id3) collapses to its live end: only id3 is offered (marked `↪`, sized as the whole chain), search hits on ancestor content redirect to it, and superseded ancestors are hidden. A parent resumed *after* a fork (divergent branches) stays visible. Fork→parent edges resolve via the compact boundary's `logicalParentUuid`, cached in the index.
-- **Fast** — ~180ms incremental sync, ~4ms search for 380+ sessions
+- **Fast** — sub-500ms incremental sync, sub-100ms search for 450+ sessions
 
 ## Requirements
 
@@ -97,6 +97,14 @@ rm ~/.claude/.sessions.db
 
 A TSV cache (`~/.claude/.sessions-unified-cache.tsv`) is also written for compatibility.
 
+### Upgrading
+
+Schema migrations are automatic, but new columns (titles from `ai-title` lines, last-message timestamps, fork lineage) only backfill when a session file changes. After pulling a new version, force one full re-index:
+
+```bash
+python3 session_indexer.py --rebuild
+```
+
 ## Launch methods
 
 ### Shell alias
@@ -158,14 +166,17 @@ Add `~/.raycast-scripts/` as a script directory in Raycast preferences.
 ## Testing
 
 ```bash
-# Search ranking tests (23 tests)
+# Search ranking + fork lineage tests (34 tests)
 python3 test_search.py
 
 # Full integration tests — indexer, search, preview (47 tests)
 bash test-session-tools.sh
+
+# Resume directory resolution tests (13 tests)
+bash test_resume_resolution.sh
 ```
 
-70 tests covering: exact phrases, short tokens, field weighting, BM25 frequency, IDF, recency tiebreakers, negation, project filters, tool_use exclusion, preview matching, and compacted sessions.
+94 tests covering: exact phrases, short tokens, field weighting, BM25 frequency, IDF, recency tiebreakers, negation, project filters, tool_use exclusion, preview matching, compacted sessions, fork-chain collapse, and resume-dir resolution (deleted worktrees, relocated transcripts).
 
 ## Roadmap
 
