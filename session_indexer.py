@@ -36,7 +36,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     project TEXT DEFAULT '',
     created_epoch INTEGER DEFAULT 0,
     mtime_epoch INTEGER DEFAULT 0,
-    size_bytes INTEGER DEFAULT 0
+    size_bytes INTEGER DEFAULT 0,
+    last_activity_epoch INTEGER DEFAULT 0,
+    is_fork INTEGER DEFAULT 0
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
@@ -70,7 +72,7 @@ END;
 
 # --- Constants ---
 
-MARKER_RE = re.compile(rb'"type":"(user|assistant|summary|custom-title)"')
+MARKER_RE = re.compile(rb'"type":"(user|assistant|summary|custom-title|ai-title)"')
 
 NOISE_PREFIXES = (
     "<local-command-caveat>",
@@ -116,19 +118,33 @@ def init_db(db_path=None):
     cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
     if "size_bytes" not in cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN size_bytes INTEGER DEFAULT 0")
+    if "last_activity_epoch" not in cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN last_activity_epoch INTEGER DEFAULT 0")
+        conn.execute("ALTER TABLE sessions ADD COLUMN is_fork INTEGER DEFAULT 0")
     return conn
 
 
-def index_session(conn, sid, title, preview, body, project, created_epoch, mtime_epoch, size_bytes=0):
+# Display/sort recency: last *message* timestamp, not file mtime. Claude Code
+# appends metadata lines (last-prompt, bridge-session, ai-title) to a session
+# file on mere open/sync, so mtime promotes dead sessions to "today".
+# Falls back to mtime for rows indexed before the column existed.
+EFF_EPOCH_SQL = "CASE WHEN last_activity_epoch > 0 THEN last_activity_epoch ELSE mtime_epoch END"
+
+
+def index_session(conn, sid, title, preview, body, project, created_epoch, mtime_epoch, size_bytes=0,
+                  last_activity_epoch=0, is_fork=0):
     """Insert or update a session in the database."""
     conn.execute("""
-        INSERT INTO sessions (sid, title, preview, body, project, created_epoch, mtime_epoch, size_bytes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO sessions (sid, title, preview, body, project, created_epoch, mtime_epoch, size_bytes,
+                              last_activity_epoch, is_fork)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(sid) DO UPDATE SET
             title=excluded.title, preview=excluded.preview, body=excluded.body,
             project=excluded.project, created_epoch=excluded.created_epoch,
-            mtime_epoch=excluded.mtime_epoch, size_bytes=excluded.size_bytes
-    """, (sid, title, preview, body, project, created_epoch, mtime_epoch, size_bytes))
+            mtime_epoch=excluded.mtime_epoch, size_bytes=excluded.size_bytes,
+            last_activity_epoch=excluded.last_activity_epoch, is_fork=excluded.is_fork
+    """, (sid, title, preview, body, project, created_epoch, mtime_epoch, size_bytes,
+          last_activity_epoch, is_fork))
 
 
 # --- Text extraction (from JSONL) ---
@@ -216,8 +232,10 @@ def _extract_one(args):
     if b'"type":"user"' not in data:
         return None
 
-    first_user = second_user = custom_title = summary = None
+    first_user = second_user = custom_title = summary = ai_title = None
+    compact_fallback = None
     real_user_count = 0
+    is_fork = 0
     body_parts = []
 
     for m in MARKER_RE.finditer(data):
@@ -229,6 +247,18 @@ def _extract_one(args):
             if not text:
                 continue  # skip tool_result-only and empty user messages
             clean = ' '.join(text[:200].split())
+            # Compact-fork summary ("This session is being continued from a
+            # previous conversation..."): not something the user typed. A fork
+            # opens with one of these before any real message — mark it, keep
+            # it as preview-of-last-resort, and let the preview fall through
+            # to the first real post-compact message.
+            if b'"isCompactSummary":true' in line:
+                if real_user_count == 0:
+                    is_fork = 1
+                if compact_fallback is None:
+                    compact_fallback = clean
+                body_parts.append(text[:2000])
+                continue
             # Skip noise messages (system artifacts, interrupts)
             is_noise = clean == "Warmup" or any(clean.startswith(p) for p in NOISE_PREFIXES)
             if not is_noise:
@@ -266,6 +296,19 @@ def _extract_one(args):
             except (json.JSONDecodeError, ValueError):
                 pass
 
+        elif tp == b'ai-title':
+            # Claude Code's generated tab title — appended on every launch,
+            # last one wins. This is the name the user sees in the terminal.
+            line = _extract_line(data, m.start())
+            try:
+                ai_title = json.loads(line).get("aiTitle") or ai_title
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+    # A fresh compact-fork may have no real user message yet — it still holds
+    # the live conversation state, so index it on the summary text.
+    if not first_user:
+        first_user = compact_fallback
     if not first_user:
         return None
 
@@ -275,8 +318,8 @@ def _extract_one(args):
     if not preview or preview.startswith("[Request interrupted") or preview.startswith("claude --resume"):
         return None
 
-    # Title priority: custom-title > summary > plan heading
-    title = custom_title or summary or ""
+    # Title priority: custom-title > ai-title > summary > plan heading
+    title = custom_title or ai_title or summary or ""
     if not title and first_user.startswith("Implement the following plan:"):
         plan = first_user[len("Implement the following plan:"):].strip().lstrip("# ")
         title = plan.split(" ## ")[0][:120]
@@ -311,7 +354,21 @@ def _extract_one(args):
         except (ValueError, OSError):
             pass
 
-    return (mtime, sid, title, preview, body, created_epoch, int(mtime), label, size)
+    # Last activity = last timestamped line (real messages), NOT file mtime —
+    # metadata appends on open would otherwise resurrect dead sessions.
+    last_activity = 0
+    ts_pos = data.rfind(b'"timestamp":"')
+    if ts_pos != -1:
+        ts_end = data.find(b'"', ts_pos + 13)
+        if ts_end != -1:
+            try:
+                dt = datetime.fromisoformat(data[ts_pos + 13:ts_end].decode().replace('Z', '+00:00'))
+                last_activity = int(dt.timestamp())
+            except (ValueError, OSError):
+                pass
+
+    return (mtime, sid, title, preview, body, created_epoch, int(mtime), label, size,
+            last_activity, is_fork)
 
 
 # --- Search ---
@@ -367,9 +424,9 @@ def search(conn, query, limit=200):
                 rank_terms.add(t.replace('-', ''))
 
     # FTS5 for matching, fetch generously for Python re-ranking
-    sql = """
+    sql = f"""
         SELECT s.sid, s.title, s.preview, s.body, s.project,
-               s.created_epoch, s.mtime_epoch, s.size_bytes
+               s.created_epoch, {EFF_EPOCH_SQL}, s.size_bytes, s.is_fork
         FROM sessions s
         JOIN sessions_fts f ON s.rowid = f.rowid
         WHERE sessions_fts MATCH ?
@@ -393,7 +450,7 @@ def search(conn, query, limit=200):
     import math
     now = time.time()
     results = []
-    for sid, title, preview, body, project, created, mtime, size_bytes in rows:
+    for sid, title, preview, body, project, created, mtime, size_bytes, is_fork in rows:
         if project_filter and project_filter not in project.lower():
             continue
         if exclude_terms:
@@ -438,7 +495,7 @@ def search(conn, query, limit=200):
             'sid': sid, 'title': title, 'preview': preview,
             'body': body, 'project': project,
             'created_epoch': created, 'mtime_epoch': mtime,
-            'size_bytes': size_bytes, 'rank': score,
+            'size_bytes': size_bytes, 'is_fork': is_fork, 'rank': score,
         })
 
     results.sort(key=lambda r: -r['rank'])  # higher = better
@@ -526,8 +583,9 @@ def sync_db(conn, files, force_rebuild=False):
     added = 0
     for r in results:
         if r:
-            _, sid, title, preview, body, created, mtime_ep, label, size = r
-            index_session(conn, sid, title, preview, body, label, created, mtime_ep, size)
+            _, sid, title, preview, body, created, mtime_ep, label, size, last_act, is_fork = r
+            index_session(conn, sid, title, preview, body, label, created, mtime_ep, size,
+                          last_act, is_fork)
             added += 1
 
     conn.commit()
@@ -552,9 +610,9 @@ def _parallel_extract(files):
 
 def write_cache(conn, cache_path=None):
     """Write TSV cache for fzf display. Field 4 = body excerpt (for fzf search)."""
-    rows = conn.execute("""
-        SELECT sid, title, preview, body, project, created_epoch, mtime_epoch
-        FROM sessions ORDER BY mtime_epoch DESC
+    rows = conn.execute(f"""
+        SELECT sid, title, preview, body, project, created_epoch, {EFF_EPOCH_SQL}
+        FROM sessions ORDER BY {EFF_EPOCH_SQL} DESC
     """).fetchall()
 
     path = cache_path or CACHE_PATH
@@ -608,9 +666,9 @@ def _humansize(n):
     return ""  # sub-10k stubs read as blank \u2014 nothing worth resuming
 
 
-def format_fzf_line(sid, title, preview, body, project, created_epoch, mtime_epoch, size_bytes=0, current_label=''):
+def format_fzf_line(sid, title, preview, body, project, created_epoch, mtime_epoch, size_bytes=0, is_fork=0, current_label=''):
     """Format a session as fzf-ready line: SID\\tDISPLAY+PAD+SEARCH."""
-    # Show last-activity date (matches the mtime_epoch DESC sort), not start date.
+    # Show last-activity date (matches the last-activity DESC sort), not start date.
     rd = _reldate(mtime_epoch)
     # Size column \u2014 disambiguates sessions that share a preview (e.g. a 29M build
     # session vs a 113-message earlier run of the same opening prompt).
@@ -621,12 +679,16 @@ def format_fzf_line(sid, title, preview, body, project, created_epoch, mtime_epo
     if project and project != current_label:
         tag = f"  \033[2m\u00b7 {project}\033[0m"
 
+    # Compact-fork marker: this session continues an earlier one under a new
+    # id \u2014 its small file size is misleading, it holds the CURRENT state.
+    fork = "\033[32m\u21aa \033[0m" if is_fork else ""
+
     # Display: date + size + title or preview + optional project tag
     if title:
-        display = f"\033[33m{rd:<5}\033[0m \033[2m{sz:>4}\033[0m \033[1m{title}\033[0m{tag}"
+        display = f"\033[33m{rd:<5}\033[0m \033[2m{sz:>4}\033[0m {fork}\033[1m{title}\033[0m{tag}"
     else:
         p = (preview[:77] + "...") if len(preview) > 80 else preview
-        display = f"\033[33m{rd:<5}\033[0m \033[2m{sz:>4}\033[0m {p}{tag}"
+        display = f"\033[33m{rd:<5}\033[0m \033[2m{sz:>4}\033[0m {fork}{p}{tag}"
 
     # Search text (pushed off-screen by padding)
     excerpt = ' '.join((body or '').split())[:300]
@@ -643,12 +705,13 @@ def fzf_output(conn, query='', current_label=''):
             print(format_fzf_line(
                 r['sid'], r['title'], r['preview'], r['body'],
                 r['project'], r['created_epoch'], r['mtime_epoch'], r['size_bytes'],
+                r.get('is_fork', 0),
                 current_label=current_label
             ))
     else:
-        rows = conn.execute("""
-            SELECT sid, title, preview, body, project, created_epoch, mtime_epoch, size_bytes
-            FROM sessions ORDER BY mtime_epoch DESC
+        rows = conn.execute(f"""
+            SELECT sid, title, preview, body, project, created_epoch, {EFF_EPOCH_SQL}, size_bytes, is_fork
+            FROM sessions ORDER BY {EFF_EPOCH_SQL} DESC
         """).fetchall()
         for row in rows:
             if not SHOW_AUTOMATED and is_automated(row[2]):

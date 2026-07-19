@@ -16,7 +16,8 @@ Fast session picker for [Claude Code](https://docs.anthropic.com/en/docs/claude-
 - **Query-matched preview** — right panel shows messages containing your search terms
 - **Advanced queries** — exact phrases (`"auth bug"`), project filter (`--project kh`), negation (`-standup`)
 - **Cross-project** — searches all projects, shows project labels for context
-- **Relative dates** — "today", "1d", "2w", "3mo"
+- **Relative dates** — "today", "1d", "2w", "3mo" — based on the last *message* timestamp, not file mtime (Claude Code touches session files on mere open, which would resurrect dead sessions)
+- **Compact-fork aware** — sessions continued under a new id after compaction show a `↪` marker and inherit their generated title, so the live continuation is distinguishable from its superseded (often much larger) parent
 - **Fast** — ~180ms incremental sync, ~4ms search for 380+ sessions
 
 ## Requirements

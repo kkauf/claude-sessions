@@ -95,7 +95,7 @@ if [[ -n "$query" ]]; then
     done
   fi
 else
-  grep '"type":"user"' "$f" 2>/dev/null | head -12 | jq -r "$jq_text" 2>/dev/null | \
+  grep '"type":"user"' "$f" 2>/dev/null | grep -v '"isCompactSummary":true' | head -12 | jq -r "$jq_text" 2>/dev/null | \
     while IFS= read -r line; do
     text="${line:4}"
     [[ -n "$text" ]] && echo -e "\033[36m>\033[0m $text" && echo
