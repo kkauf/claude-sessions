@@ -179,6 +179,12 @@ final class PickerController: NSObject, NSTextFieldDelegate, NSTableViewDataSour
         effect.state = .active
         effect.wantsLayer = true
         effect.layer?.cornerRadius = 12
+        // SP_OPAQUE=1: solid background instead of vibrancy — used for demo
+        // screenshots so no desktop content can bleed through the blur.
+        if ProcessInfo.processInfo.environment["SP_OPAQUE"] != nil {
+            effect.state = .inactive
+            effect.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        }
         panel.contentView = effect
 
         field.frame = NSRect(x: 16, y: height - 46, width: width - 120, height: 30)

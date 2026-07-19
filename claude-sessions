@@ -8,8 +8,8 @@
 shopt -s nullglob
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CLAUDE_PROJECTS="$HOME/.claude/projects"
-UNIFIED_CACHE="$HOME/.claude/.sessions-unified-cache.tsv"
+CLAUDE_PROJECTS="${SESSION_PROJECTS_DIR:-$HOME/.claude/projects}"
+UNIFIED_CACHE="${SESSION_CACHE_PATH:-$HOME/.claude/.sessions-unified-cache.tsv}"
 SNAPSHOT_FILE="$HOME/.claude/.session-snapshot.tsv"
 
 # Derive home directory key (how Claude Code encodes paths)
@@ -335,7 +335,7 @@ selected=$(echo "$initial" | fzf \
   --header="$session_count sessions · ctrl-/ toggle preview" \
   --bind="ctrl-/:toggle-preview" \
   --bind="change:reload(python3 '$SCRIPT_DIR/session_indexer.py' --fzf --label '$CL' --search {q} 2>/dev/null || true)" \
-  --height=80% \
+  --height="${CLAUDE_SESSIONS_HEIGHT:-80%}" \
   --reverse \
   --border \
   --prompt="sessions > " \

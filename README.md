@@ -11,7 +11,7 @@ Claude Code's built-in `/resume` lists recent sessions in the current project, i
 brew install kkauf/tap/claude-sessions
 ```
 
-![Browse sessions](picker-browse.png)
+![Browse sessions — ● live, ↪ compact-fork collapsed, signal-aware preview](picker-browse.png)
 
 ![Search for "week 12"](picker-search.png)
 

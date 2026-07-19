@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 sessions.db
 SessionPicker.app/
+demo/projects/
+demo/sessions.db*
+demo/cache.tsv*
