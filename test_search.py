@@ -10,7 +10,7 @@ Run: python3 test_search.py
 import os, sys, tempfile, unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
-from session_indexer import init_db, index_session, search
+from session_indexer import init_db, index_session, search, lineage_info
 
 
 class SearchTestCase(unittest.TestCase):
@@ -275,6 +275,76 @@ class TestOutputFormat(SearchTestCase):
         self.assertEqual(r['created_epoch'], 1000)
         self.assertEqual(r['mtime_epoch'], 2000)
         self.assertIn('rank', r)
+
+
+class TestForkLineage(SearchTestCase):
+    """Compact-fork chains collapse to their live terminal session."""
+
+    def link(self, child, parent):
+        self.conn.execute(
+            "UPDATE sessions SET parent_sid = ?, parent_uuid = 'u-' || ? WHERE sid = ?",
+            (parent, parent, child))
+        self.conn.commit()
+
+    def test_chain_hides_ancestors_and_finds_terminal(self):
+        """id1 -> id2 -> id3: only id3 offered; ancestors hidden."""
+        self.add('id1', body='ema trading rules', mtime=1000)
+        self.add('id2', body='continued ema work', mtime=2000)
+        self.add('id3', body='latest state', mtime=3000)
+        self.link('id2', 'id1')
+        self.link('id3', 'id2')
+        hidden, terminal_of, cum = lineage_info(self.conn)
+        self.assertEqual(hidden, {'id1', 'id2'})
+        self.assertEqual(terminal_of['id1'], 'id3')
+        self.assertEqual(terminal_of['id2'], 'id3')
+        self.assertEqual(terminal_of['id3'], 'id3')
+
+    def test_search_redirects_ancestor_hit_to_terminal(self):
+        """A query matching only the ancestor's body offers the terminal."""
+        self.add('old', body='discussed the zanzibar migration plan', mtime=1000)
+        self.add('new', body='fresh continuation content', mtime=2000)
+        self.link('new', 'old')
+        results = search(self.conn, 'zanzibar')
+        sids = [r['sid'] for r in results]
+        self.assertIn('new', sids)
+        self.assertNotIn('old', sids)
+
+    def test_chain_members_dedupe_to_one_result(self):
+        """Both chain members match -> a single terminal entry."""
+        self.add('old', body='kubernetes cluster setup', mtime=1000)
+        self.add('new', body='kubernetes cluster teardown', mtime=2000)
+        self.link('new', 'old')
+        results = search(self.conn, 'kubernetes')
+        self.assertEqual([r['sid'] for r in results], ['new'])
+
+    def test_revived_parent_stays_visible(self):
+        """Parent resumed AFTER the fork has newer activity — don't hide it."""
+        self.add('parent', body='original work', mtime=3000)
+        self.add('child', body='forked continuation', mtime=2000)
+        self.link('child', 'parent')
+        hidden, _, _ = lineage_info(self.conn)
+        self.assertEqual(hidden, set())
+
+    def test_unresolved_and_missing_parents_are_inert(self):
+        """'?' (not found) and dangling parent_sid links change nothing."""
+        self.add('a', body='alpha content', mtime=1000)
+        self.add('b', body='beta content', mtime=2000)
+        self.conn.execute("UPDATE sessions SET parent_sid = '?' WHERE sid = 'a'")
+        self.conn.execute("UPDATE sessions SET parent_sid = 'gone' WHERE sid = 'b'")
+        self.conn.commit()
+        hidden, terminal_of, _ = lineage_info(self.conn)
+        self.assertEqual(hidden, set())
+        self.assertEqual(terminal_of['a'], 'a')
+
+    def test_cumulative_size_charged_to_terminal(self):
+        self.add('id1', body='x', mtime=1000)
+        self.add('id2', body='y', mtime=2000)
+        self.conn.execute("UPDATE sessions SET size_bytes = 100 WHERE sid = 'id1'")
+        self.conn.execute("UPDATE sessions SET size_bytes = 7 WHERE sid = 'id2'")
+        self.conn.commit()
+        self.link('id2', 'id1')
+        _, _, cum = lineage_info(self.conn)
+        self.assertEqual(cum['id2'], 107)
 
 
 if __name__ == '__main__':

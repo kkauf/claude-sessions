@@ -11,7 +11,7 @@ Usage:
   python3 session_indexer.py --timing     # Show performance stats
 """
 
-import json, multiprocessing, os, re, sqlite3, sys, time, warnings
+import json, multiprocessing, os, re, sqlite3, subprocess, sys, time, warnings
 from datetime import datetime, timezone
 from concurrent.futures import ProcessPoolExecutor
 
@@ -38,7 +38,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     mtime_epoch INTEGER DEFAULT 0,
     size_bytes INTEGER DEFAULT 0,
     last_activity_epoch INTEGER DEFAULT 0,
-    is_fork INTEGER DEFAULT 0
+    is_fork INTEGER DEFAULT 0,
+    parent_uuid TEXT DEFAULT '',
+    parent_sid TEXT DEFAULT ''
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
@@ -121,6 +123,9 @@ def init_db(db_path=None):
     if "last_activity_epoch" not in cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN last_activity_epoch INTEGER DEFAULT 0")
         conn.execute("ALTER TABLE sessions ADD COLUMN is_fork INTEGER DEFAULT 0")
+    if "parent_uuid" not in cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN parent_uuid TEXT DEFAULT ''")
+        conn.execute("ALTER TABLE sessions ADD COLUMN parent_sid TEXT DEFAULT ''")
     return conn
 
 
@@ -132,19 +137,26 @@ EFF_EPOCH_SQL = "CASE WHEN last_activity_epoch > 0 THEN last_activity_epoch ELSE
 
 
 def index_session(conn, sid, title, preview, body, project, created_epoch, mtime_epoch, size_bytes=0,
-                  last_activity_epoch=0, is_fork=0):
-    """Insert or update a session in the database."""
+                  last_activity_epoch=0, is_fork=0, parent_uuid=''):
+    """Insert or update a session in the database.
+
+    parent_sid (the resolved parent session) is preserved across re-indexing —
+    resolution is expensive; it's only cleared when parent_uuid changes.
+    """
     conn.execute("""
         INSERT INTO sessions (sid, title, preview, body, project, created_epoch, mtime_epoch, size_bytes,
-                              last_activity_epoch, is_fork)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              last_activity_epoch, is_fork, parent_uuid)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(sid) DO UPDATE SET
             title=excluded.title, preview=excluded.preview, body=excluded.body,
             project=excluded.project, created_epoch=excluded.created_epoch,
             mtime_epoch=excluded.mtime_epoch, size_bytes=excluded.size_bytes,
-            last_activity_epoch=excluded.last_activity_epoch, is_fork=excluded.is_fork
+            last_activity_epoch=excluded.last_activity_epoch, is_fork=excluded.is_fork,
+            parent_sid=CASE WHEN excluded.parent_uuid = sessions.parent_uuid
+                            THEN sessions.parent_sid ELSE '' END,
+            parent_uuid=excluded.parent_uuid
     """, (sid, title, preview, body, project, created_epoch, mtime_epoch, size_bytes,
-          last_activity_epoch, is_fork))
+          last_activity_epoch, is_fork, parent_uuid))
 
 
 # --- Text extraction (from JSONL) ---
@@ -367,8 +379,17 @@ def _extract_one(args):
             except (ValueError, OSError):
                 pass
 
+    # A fork's opening compact_boundary references a message uuid in its
+    # parent session — the edge that lets the picker collapse fork chains.
+    # First occurrence only: later in-place compactions reference this file.
+    parent_uuid = ""
+    if is_fork:
+        pm = re.search(rb'"logicalParentUuid":"([0-9a-fA-F-]{36})"', data)
+        if pm:
+            parent_uuid = pm.group(1).decode()
+
     return (mtime, sid, title, preview, body, created_epoch, int(mtime), label, size,
-            last_activity, is_fork)
+            last_activity, is_fork, parent_uuid)
 
 
 # --- Search ---
@@ -498,7 +519,26 @@ def search(conn, query, limit=200):
             'size_bytes': size_bytes, 'is_fork': is_fork, 'rank': score,
         })
 
-    results.sort(key=lambda r: -r['rank'])  # higher = better
+    # Collapse fork chains: a hit on a superseded ancestor offers the live
+    # terminal session instead (that's the one worth resuming), keeping the
+    # ancestor's rank. Dedupe when several chain members match the query.
+    hidden, terminal_of, cum = lineage_info(conn)
+    best = {}
+    for r in results:
+        t = terminal_of.get(r['sid'], r['sid'])
+        if t != r['sid']:
+            row = conn.execute(f"""
+                SELECT title, preview, body, project, created_epoch, {EFF_EPOCH_SQL}, size_bytes, is_fork
+                FROM sessions WHERE sid = ?""", (t,)).fetchone()
+            if row:
+                r = {'sid': t, 'title': row[0], 'preview': row[1], 'body': row[2],
+                     'project': row[3], 'created_epoch': row[4], 'mtime_epoch': row[5],
+                     'size_bytes': row[6], 'is_fork': row[7], 'rank': r['rank']}
+        r['size_bytes'] = cum.get(r['sid'], r['size_bytes'])
+        if r['sid'] not in best or r['rank'] > best[r['sid']]['rank']:
+            best[r['sid']] = r
+
+    results = sorted(best.values(), key=lambda r: -r['rank'])  # higher = better
     return results[:limit]
 
 
@@ -583,13 +623,89 @@ def sync_db(conn, files, force_rebuild=False):
     added = 0
     for r in results:
         if r:
-            _, sid, title, preview, body, created, mtime_ep, label, size, last_act, is_fork = r
+            _, sid, title, preview, body, created, mtime_ep, label, size, last_act, is_fork, puuid = r
             index_session(conn, sid, title, preview, body, label, created, mtime_ep, size,
-                          last_act, is_fork)
+                          last_act, is_fork, puuid)
             added += 1
 
+    _resolve_parents(conn, file_map)
     conn.commit()
     return added, len(to_process) - added, removed
+
+
+def _resolve_parents(conn, file_map):
+    """Resolve fork parent_uuid -> parent session id, once per fork.
+
+    The parent uuid is a message uuid inside the parent's transcript; grep the
+    fork's sibling files (same project) for it. Result is cached in parent_sid
+    ('?' = searched, not found — never retried), so this is a no-op on every
+    sync without a fresh fork.
+    """
+    pending = conn.execute(
+        "SELECT sid, parent_uuid, project FROM sessions"
+        " WHERE parent_uuid != '' AND parent_sid = ''").fetchall()
+    for sid, puuid, project in pending:
+        # Same project family: a session can be re-homed between a repo's main
+        # folder and its worktree folders, so match on the base project label.
+        base = project.split('--claude-worktrees')[0]
+        candidates = [args[0] for s2, args in file_map.items()
+                      if args[4].split('--claude-worktrees')[0] == base and s2 != sid]
+        parent_sid = '?'
+        if candidates:
+            try:
+                out = subprocess.run(
+                    ['grep', '-l', '-F', f'"uuid":"{puuid}"', *candidates],
+                    capture_output=True, text=True, timeout=60)
+                hit = out.stdout.split('\n', 1)[0].strip()
+                if hit:
+                    parent_sid = os.path.basename(hit)[:-6]  # strip .jsonl
+            except (OSError, subprocess.SubprocessError):
+                parent_sid = ''  # transient failure — retry next sync
+        if parent_sid:
+            conn.execute("UPDATE sessions SET parent_sid = ? WHERE sid = ?",
+                         (parent_sid, sid))
+
+
+def lineage_info(conn):
+    """Map fork chains: returns (hidden_sids, terminal_of, cumulative_size).
+
+    A session is hidden when a resolved child session's last activity is at or
+    after its own — the conversation moved on under the child's id. (A parent
+    resumed AFTER its fork has newer activity and stays visible.) terminal_of
+    follows child links to the live end of each chain; cumulative_size charges
+    hidden ancestors' bytes to their terminal so the entry reflects the whole
+    conversation.
+    """
+    rows = conn.execute(
+        f"SELECT sid, parent_sid, {EFF_EPOCH_SQL}, size_bytes FROM sessions").fetchall()
+    eff = {sid: e for sid, _, e, _ in rows}
+    size = {sid: s for sid, _, _, s in rows}
+    children = {}
+    for sid, psid, _, _ in rows:
+        if psid and psid != '?' and psid in eff:
+            children.setdefault(psid, []).append(sid)
+
+    hidden = {psid for psid, kids in children.items()
+              if any(eff[k] >= eff[psid] for k in kids)}
+
+    def terminal(sid):
+        cur, seen = sid, {sid}
+        while cur in hidden:
+            kids = [k for k in children.get(cur, []) if k not in seen]
+            if not kids:
+                break
+            cur = max(kids, key=lambda k: eff[k])
+            seen.add(cur)
+        return cur
+
+    terminal_of = {sid: terminal(sid) for sid in eff}
+
+    cum = dict(size)
+    for sid in hidden:
+        t = terminal_of[sid]
+        if t != sid:
+            cum[t] = cum.get(t, 0) + size.get(sid, 0)
+    return hidden, terminal_of, cum
 
 
 def _parallel_extract(files):
@@ -610,6 +726,7 @@ def _parallel_extract(files):
 
 def write_cache(conn, cache_path=None):
     """Write TSV cache for fzf display. Field 4 = body excerpt (for fzf search)."""
+    hidden, _, _ = lineage_info(conn)
     rows = conn.execute(f"""
         SELECT sid, title, preview, body, project, created_epoch, {EFF_EPOCH_SQL}
         FROM sessions ORDER BY {EFF_EPOCH_SQL} DESC
@@ -620,6 +737,8 @@ def write_cache(conn, cache_path=None):
     written = 0
     with open(tmp, 'w') as f:
         for sid, title, preview, body, project, created, mtime in rows:
+            if sid in hidden:
+                continue
             if not SHOW_AUTOMATED and is_automated(preview):
                 continue
             excerpt = ' '.join(body.split())[:600]
@@ -709,14 +828,20 @@ def fzf_output(conn, query='', current_label=''):
                 current_label=current_label
             ))
     else:
+        hidden, _, cum = lineage_info(conn)
         rows = conn.execute(f"""
             SELECT sid, title, preview, body, project, created_epoch, {EFF_EPOCH_SQL}, size_bytes, is_fork
             FROM sessions ORDER BY {EFF_EPOCH_SQL} DESC
         """).fetchall()
         for row in rows:
+            if row[0] in hidden:
+                continue  # superseded by a compact-fork child — offer only the live end
             if not SHOW_AUTOMATED and is_automated(row[2]):
                 continue
-            print(format_fzf_line(*row, current_label=current_label))
+            sid, title, preview, body, project, created, eff, size_bytes, is_fork = row
+            print(format_fzf_line(sid, title, preview, body, project, created, eff,
+                                  cum.get(sid, size_bytes), is_fork,
+                                  current_label=current_label))
 
 
 # --- Filesystem scan ---

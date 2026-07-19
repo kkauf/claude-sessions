@@ -17,7 +17,7 @@ Fast session picker for [Claude Code](https://docs.anthropic.com/en/docs/claude-
 - **Advanced queries** — exact phrases (`"auth bug"`), project filter (`--project kh`), negation (`-standup`)
 - **Cross-project** — searches all projects, shows project labels for context
 - **Relative dates** — "today", "1d", "2w", "3mo" — based on the last *message* timestamp, not file mtime (Claude Code touches session files on mere open, which would resurrect dead sessions)
-- **Compact-fork aware** — sessions continued under a new id after compaction show a `↪` marker and inherit their generated title, so the live continuation is distinguishable from its superseded (often much larger) parent
+- **Compact-fork aware** — when compaction continues a conversation under a new session id, the chain (id1 → id2 → id3) collapses to its live end: only id3 is offered (marked `↪`, sized as the whole chain), search hits on ancestor content redirect to it, and superseded ancestors are hidden. A parent resumed *after* a fork (divergent branches) stays visible. Fork→parent edges resolve via the compact boundary's `logicalParentUuid`, cached in the index.
 - **Fast** — ~180ms incremental sync, ~4ms search for 380+ sessions
 
 ## Requirements
