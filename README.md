@@ -105,6 +105,31 @@ Schema migrations are automatic, but new columns (titles from `ai-title` lines, 
 python3 session_indexer.py --rebuild
 ```
 
+## SessionPicker.app (macOS, no terminal, no Raycast)
+
+A native Spotlight-style panel over the same index — one Swift file, no Xcode project, no Electron, no dependencies. Click the Dock icon → type to search → conversation preview on the right (query-matched while searching) → `Enter` opens iTerm at the session's directory and resumes it. Live sessions show a red `●` (don't resume those — they're attached to an open terminal; resuming would fork state).
+
+```bash
+./build-app.sh --install   # builds, copies to ~/Applications, launches
+```
+
+Keep it in the Dock (right-click → Options → Keep in Dock); clicking the icon toggles the panel. Optionally add it as a Login Item (System Settings → General → Login Items).
+
+- **Triggers**: Dock icon click, or `open -a SessionPicker` (bind that to anything).
+- **Global hotkey (opt-in, off by default)**: `defaults write earth.kaufmann.SessionPicker HotKeyCode -int 49 && defaults write earth.kaufmann.SessionPicker HotKeyMods -int 2048` (Carbon codes; 49+2048 = ⌥Space), then relaunch. If another app owns the combo (Raycast, Spotlight), registration fails — check `log show --last 5m --predicate 'process == "SessionPicker"'`.
+- **Paths**: override with `defaults write earth.kaufmann.SessionPicker IndexerPath|OpenerPath|PreviewPath|PythonPath <path>` if the repo doesn't live at `~/github/claude-sessions`.
+
+All logic stays in the CLI — the app shells out to `session_indexer.py --json` for search and `claude-sessions open <sid>` for resume, so the terminal picker and the app can never disagree.
+
+### Headless contract (build your own front-end)
+
+```bash
+python3 session_indexer.py --json                      # browse rows as JSON
+python3 session_indexer.py --json --search "auth bug"  # search rows as JSON
+claude-sessions open <sid>                             # resolve dir + resume in iTerm
+claude-sessions open <sid> --print                     # print the resume command instead
+```
+
 ## Launch methods
 
 ### Shell alias

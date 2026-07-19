@@ -785,7 +785,7 @@ def _humansize(n):
     return ""  # sub-10k stubs read as blank \u2014 nothing worth resuming
 
 
-def format_fzf_line(sid, title, preview, body, project, created_epoch, mtime_epoch, size_bytes=0, is_fork=0, current_label=''):
+def format_fzf_line(sid, title, preview, body, project, created_epoch, mtime_epoch, size_bytes=0, is_fork=0, active=0, current_label=''):
     """Format a session as fzf-ready line: SID\\tDISPLAY+PAD+SEARCH."""
     # Show last-activity date (matches the last-activity DESC sort), not start date.
     rd = _reldate(mtime_epoch)
@@ -801,6 +801,10 @@ def format_fzf_line(sid, title, preview, body, project, created_epoch, mtime_epo
     # Compact-fork marker: this session continues an earlier one under a new
     # id \u2014 its small file size is misleading, it holds the CURRENT state.
     fork = "\033[32m\u21aa \033[0m" if is_fork else ""
+    # Live marker: message activity in the last 5 min \u2014 likely attached to an
+    # open terminal; resuming it AGAIN would fork state. Go to that window.
+    if active:
+        fork = f"\033[31m\u25cf \033[0m{fork}"
 
     # Display: date + size + title or preview + optional project tag
     if title:
@@ -816,32 +820,68 @@ def format_fzf_line(sid, title, preview, body, project, created_epoch, mtime_epo
     return f"{sid}\t{display}{PAD}{search_text}"
 
 
-def fzf_output(conn, query='', current_label=''):
-    """Output fzf-formatted lines: search results or all sessions by recency."""
+def list_rows(conn, query=''):
+    """Session rows for any front-end: search results or browse-by-recency.
+
+    Returns dicts with lineage collapse and the automated filter applied,
+    plus 'active' (last message within 5 minutes — probably attached to a
+    live terminal; resuming it would fork state).
+    """
+    now = time.time()
     if query and query.strip():
-        results = search(conn, query)
-        for r in results:
-            print(format_fzf_line(
-                r['sid'], r['title'], r['preview'], r['body'],
-                r['project'], r['created_epoch'], r['mtime_epoch'], r['size_bytes'],
-                r.get('is_fork', 0),
-                current_label=current_label
-            ))
+        rows = search(conn, query)
     else:
         hidden, _, cum = lineage_info(conn)
-        rows = conn.execute(f"""
+        rows = []
+        for row in conn.execute(f"""
             SELECT sid, title, preview, body, project, created_epoch, {EFF_EPOCH_SQL}, size_bytes, is_fork
             FROM sessions ORDER BY {EFF_EPOCH_SQL} DESC
-        """).fetchall()
-        for row in rows:
-            if row[0] in hidden:
-                continue  # superseded by a compact-fork child — offer only the live end
-            if not SHOW_AUTOMATED and is_automated(row[2]):
-                continue
+        """).fetchall():
             sid, title, preview, body, project, created, eff, size_bytes, is_fork = row
-            print(format_fzf_line(sid, title, preview, body, project, created, eff,
-                                  cum.get(sid, size_bytes), is_fork,
-                                  current_label=current_label))
+            if sid in hidden:
+                continue  # superseded by a compact-fork child — offer only the live end
+            rows.append({
+                'sid': sid, 'title': title, 'preview': preview, 'body': body,
+                'project': project, 'created_epoch': created, 'mtime_epoch': eff,
+                'size_bytes': cum.get(sid, size_bytes), 'is_fork': is_fork,
+            })
+    searching = bool(query and query.strip())
+    out = []
+    for r in rows:
+        # Automated sessions stay findable via explicit search — they're only
+        # hidden from the default recency listing.
+        if not searching and not SHOW_AUTOMATED and is_automated(r['preview']):
+            continue
+        r['active'] = 1 if now - r['mtime_epoch'] < 300 else 0
+        out.append(r)
+    return out
+
+
+def fzf_output(conn, query='', current_label=''):
+    """Output fzf-formatted lines: search results or all sessions by recency."""
+    for r in list_rows(conn, query):
+        print(format_fzf_line(
+            r['sid'], r['title'], r['preview'], r['body'],
+            r['project'], r['created_epoch'], r['mtime_epoch'], r['size_bytes'],
+            r.get('is_fork', 0), r['active'],
+            current_label=current_label
+        ))
+
+
+def json_output(conn, query='', limit=100):
+    """JSON rows for GUI front-ends (SessionPicker.app etc.)."""
+    rows = list_rows(conn, query)[:limit]
+    print(json.dumps([{
+        'sid': r['sid'],
+        'title': r['title'],
+        'preview': r['preview'][:160],
+        'project': r['project'],
+        'last_epoch': r['mtime_epoch'],
+        'reldate': _reldate(r['mtime_epoch']).strip(),
+        'size': _humansize(r['size_bytes']),
+        'is_fork': r.get('is_fork', 0),
+        'active': r['active'],
+    } for r in rows]))
 
 
 # --- Filesystem scan ---
@@ -901,8 +941,16 @@ def main():
     timing = "--timing" in sys.argv
     force = "--rebuild" in sys.argv
     fzf_mode = "--fzf" in sys.argv
+    json_mode = "--json" in sys.argv
     search_query = _get_arg("--search")
     label = _get_arg("--label") or ''
+
+    # JSON mode: rows for GUI front-ends (browse or search)
+    if json_mode:
+        conn = init_db()
+        json_output(conn, query=search_query or '')
+        conn.close()
+        return
 
     # fzf mode: output formatted lines for fzf display (used by reload)
     if fzf_mode:
