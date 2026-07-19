@@ -179,11 +179,13 @@ final class PickerController: NSObject, NSTextFieldDelegate, NSTableViewDataSour
         effect.state = .active
         effect.wantsLayer = true
         effect.layer?.cornerRadius = 12
-        // SP_OPAQUE=1: solid background instead of vibrancy — used for demo
-        // screenshots so no desktop content can bleed through the blur.
+        // SP_OPAQUE=1: screenshot mode — solid background instead of vibrancy
+        // (nothing bleeds through the blur) and the panel stays visible even
+        // if the app loses focus mid-capture.
         if ProcessInfo.processInfo.environment["SP_OPAQUE"] != nil {
             effect.state = .inactive
             effect.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+            panel.hidesOnDeactivate = false
         }
         panel.contentView = effect
 

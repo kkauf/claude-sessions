@@ -139,6 +139,8 @@ python3 session_indexer.py --rebuild
 
 A native Spotlight-style panel over the same index — one Swift file, no Xcode project, no Electron, no dependencies. Click the Dock icon → type to search → conversation preview on the right (query-matched while searching) → `Enter` opens your terminal (iTerm2 if installed, else Terminal.app) at the session's directory and resumes it. Live sessions show a red `●` (don't resume those — they're attached to an open terminal; resuming would fork state).
 
+![SessionPicker.app — native panel over the same index](sessionpicker-app.png)
+
 ```bash
 ./build-app.sh --install   # builds, copies to ~/Applications, launches
 ```
