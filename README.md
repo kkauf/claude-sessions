@@ -30,6 +30,17 @@ Fast session picker for [Claude Code](https://docs.anthropic.com/en/docs/claude-
 
 ## Install
 
+### Homebrew
+
+```bash
+brew install kkauf/tap/claude-sessions
+
+# optional native macOS app (Dock-icon picker):
+bash "$(brew --prefix)/opt/claude-sessions/libexec/build-app.sh" --install
+```
+
+### From a clone
+
 ```bash
 git clone https://github.com/kkauf/claude-sessions.git
 cd claude-sessions
