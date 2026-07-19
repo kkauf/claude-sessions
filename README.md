@@ -1,6 +1,15 @@
 # claude-sessions
 
-Fast session picker for [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Search and resume any session across all projects with full-text search, BM25 ranking, and live previews.
+Find and resume any [Claude Code](https://docs.anthropic.com/en/docs/claude-code) conversation by **what you discussed** — across every project, hundreds of sessions deep.
+
+Claude Code's built-in `/resume` lists recent sessions in the current project, identified by their opening message. Use Claude Code daily and that stops scaling: the conversation you need is three weeks old, lives in another project, and what you remember is what it was *about* — not how it started. `claude-sessions` full-text-indexes every transcript on your machine and gets you back into the right one in seconds:
+
+- **Terminal picker** — fzf UI: type to search, conversation preview, `Enter` resumes in place
+- **SessionPicker.app** (macOS, optional) — the same index behind a native Spotlight-style panel: click the Dock icon, search, `Enter` resumes in your terminal. One Swift file — no Electron, no Raycast, no dependencies. [Details below.](#sessionpickerapp-macos-no-terminal-no-raycast)
+
+```bash
+brew install kkauf/tap/claude-sessions
+```
 
 ![Browse sessions](picker-browse.png)
 
@@ -13,11 +22,12 @@ Fast session picker for [Claude Code](https://docs.anthropic.com/en/docs/claude-
 - **BM25 ranking** — title matches (10x) outrank preview matches (5x) outrank body matches (1x). Short tokens, numbers, and special characters all work.
 - **Live re-search** — typing updates results via FTS5 query (not fzf fuzzy filtering). Results are fully replaced and re-ranked on every keystroke.
 - **Smart extraction** — indexes user messages + assistant text blocks (first and last per response). Skips tool calls, file reads, and JSON noise.
-- **Signal-aware preview** — right panel shows the conversation's opening user messages plus a "latest" section (recent messages + closing assistant remark) so you see both what it's about and where it left off. System-reminders, hook output, command echoes, image-only messages, and tool noise are filtered. While searching, the preview switches to query-matched messages with the terms highlighted.
+- **Signal-aware preview** — opening messages plus a "— latest —" tail, so you see what a session is about *and* where it left off. Injected noise (system-reminders, hook output, command echoes, tool dumps) never appears. While searching, the preview switches to query-matched messages with terms highlighted.
 - **Advanced queries** — exact phrases (`"auth bug"`), project filter (`--project kh`), negation (`-standup`)
 - **Cross-project** — searches all projects, shows project labels for context
-- **Relative dates** — "today", "1d", "2w", "3mo" — based on the last *message* timestamp, not file mtime (Claude Code touches session files on mere open, which would resurrect dead sessions)
-- **Compact-fork aware** — when compaction continues a conversation under a new session id, the chain (id1 → id2 → id3) collapses to its live end: only id3 is offered (marked `↪`, sized as the whole chain), search hits on ancestor content redirect to it, and superseded ancestors are hidden. A parent resumed *after* a fork (divergent branches) stays visible. Fork→parent edges resolve via the compact boundary's `logicalParentUuid`, cached in the index.
+- **True recency** — "today"/"1d"/"2w" from the last *message* timestamp, not file mtime
+- **Compact-fork aware** — when compaction moves a conversation to a new session id, the chain collapses to its live end: one `↪` entry sized as the whole chain; superseded ancestors are hidden, and search hits on their content redirect to the resumable session. ([Mechanics below.](#fork-lineage--recency))
+- **Live-session guard** — a red `●` marks sessions with activity in the last minutes: they're attached to an open terminal, and resuming them again would fork the conversation.
 - **Fast** — sub-500ms incremental sync, sub-100ms search for 450+ sessions
 
 ## Requirements
@@ -100,6 +110,13 @@ Formatted results replace fzf list entirely
 
 No fuzzy matching artifacts. No filtering of stale results. Every keystroke is a fresh database query.
 
+### Fork lineage & recency
+
+Two Claude Code behaviors make naive listings lie, and the indexer corrects both:
+
+- **File mtime lies.** Claude Code appends metadata (`last-prompt`, `bridge-session`, `ai-title`) to a session file when you merely open it, resurrecting dead sessions to "today". Sorting and dates use the last *message* timestamp instead; mtime only drives incremental sync.
+- **Compaction can fork.** When a conversation is compacted into a new session id, the fork's opening boundary carries a `logicalParentUuid` — a message uuid that exists in exactly one other transcript: the parent. The indexer resolves that edge once (searching sibling project files, worktree folders included), caches it, and collapses chains at display time. A parent resumed *after* its fork (genuinely divergent branches) keeps both branches visible.
+
 ### Data
 
 The FTS5 database lives at `~/.claude/.sessions.db`. Delete it to force a full rebuild:
@@ -120,7 +137,7 @@ python3 session_indexer.py --rebuild
 
 ## SessionPicker.app (macOS, no terminal, no Raycast)
 
-A native Spotlight-style panel over the same index — one Swift file, no Xcode project, no Electron, no dependencies. Click the Dock icon → type to search → conversation preview on the right (query-matched while searching) → `Enter` opens iTerm at the session's directory and resumes it. Live sessions show a red `●` (don't resume those — they're attached to an open terminal; resuming would fork state).
+A native Spotlight-style panel over the same index — one Swift file, no Xcode project, no Electron, no dependencies. Click the Dock icon → type to search → conversation preview on the right (query-matched while searching) → `Enter` opens your terminal (iTerm2 if installed, else Terminal.app) at the session's directory and resumes it. Live sessions show a red `●` (don't resume those — they're attached to an open terminal; resuming would fork state).
 
 ```bash
 ./build-app.sh --install   # builds, copies to ~/Applications, launches
