@@ -13,7 +13,7 @@ brew install kkauf/tap/claude-sessions
 
 ![Browse sessions — ● live, ↪ compact-fork collapsed, signal-aware preview](picker-browse.png)
 
-![Search for "week 12"](picker-search.png)
+![Search for "auth token" — matches across projects, terms highlighted in the preview](picker-search.png)
 
 ## Features
 
