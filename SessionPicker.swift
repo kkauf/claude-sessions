@@ -39,9 +39,14 @@ struct SessionRow: Decodable {
 enum Paths {
     static func expand(_ p: String) -> String { (p as NSString).expandingTildeInPath }
 
+    /// The clone this app was built from — baked into Info.plist by build-app.sh.
+    static var repo: String {
+        (Bundle.main.object(forInfoDictionaryKey: "RepoPath") as? String)
+            ?? expand("~/github/claude-sessions")
+    }
     static var indexer: String {
         expand(UserDefaults.standard.string(forKey: "IndexerPath")
-               ?? "~/github/claude-sessions/session_indexer.py")
+               ?? repo + "/session_indexer.py")
     }
     static var previewScript: String {
         if let p = UserDefaults.standard.string(forKey: "PreviewPath") { return expand(p) }
@@ -52,8 +57,8 @@ enum Paths {
     }
     static var opener: String {
         if let p = UserDefaults.standard.string(forKey: "OpenerPath") { return expand(p) }
-        for c in ["/opt/homebrew/bin/claude-sessions", "/usr/local/bin/claude-sessions",
-                  expand("~/github/claude-sessions/claude-sessions")] {
+        for c in [repo + "/claude-sessions",
+                  "/opt/homebrew/bin/claude-sessions", "/usr/local/bin/claude-sessions"] {
             if FileManager.default.isExecutableFile(atPath: c) { return c }
         }
         return "claude-sessions"

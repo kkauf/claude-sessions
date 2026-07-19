@@ -722,6 +722,198 @@ def _parallel_extract(files):
         return list(pool.map(_extract_one, files_sorted, chunksize=chunksize))
 
 
+# --- Preview (shared by fzf pane and SessionPicker.app) ---
+#
+# Signal hierarchy (derived with the knowledge-base prefilter, see
+# session_prefilter.py there): user messages are the spine of "what is this
+# about"; assistant responses follow opening remark → tool noise → closing
+# summary, so only the first/last text blocks ("gems") carry signal; injected
+# system-reminders, hook outputs, and command echoes are never signal.
+
+_SYSTEM_REMINDER_RE = re.compile(r'<system-reminder>.*?</system-reminder>', re.DOTALL)
+_HOOK_OUTPUT_RE = re.compile(r'UserPromptSubmit hook success:.*?(?=\n\n|\Z)', re.DOTALL)
+_IMG_ONLY_RE = re.compile(r'^(\[Image[^\]]*\]\s*)+$')
+
+_PREVIEW_HEAD_CAP = 4_000_000   # bytes of file head parsed for the opening
+_PREVIEW_TAIL_CAP = 2_000_000   # bytes of file tail parsed for "where it left off"
+
+DIM, BOLD, CYAN, GREEN, YELLOW, RESET = "\033[2m", "\033[1m", "\033[36m", "\033[32m", "\033[1;33m", "\033[0m"
+
+
+def _clean_user_text(text):
+    """Noise-strip a user message; None if nothing user-authored remains."""
+    text = _SYSTEM_REMINDER_RE.sub('', text)
+    text = _HOOK_OUTPUT_RE.sub('', text)
+    clean = ' '.join(text.split())
+    if not clean or clean == "Warmup":
+        return None
+    if any(clean.startswith(p) for p in NOISE_PREFIXES):
+        return None
+    if clean.startswith("<task-notification>") or clean.startswith("This session is being continued"):
+        return None
+    if _IMG_ONLY_RE.match(clean):
+        return None
+    return clean
+
+
+def _find_session_file(sid):
+    """Largest transcript with this sid across project dirs (stubs lose)."""
+    best = None
+    try:
+        for proj in os.scandir(PROJECTS_DIR):
+            if not proj.is_dir():
+                continue
+            p = os.path.join(proj.path, sid + '.jsonl')
+            try:
+                sz = os.path.getsize(p)
+            except OSError:
+                continue
+            if best is None or sz > best[1]:
+                best = (p, sz, proj.name)
+    except OSError:
+        pass
+    return best  # (path, size, project_dirname) or None
+
+
+def _chunk_messages(chunk):
+    """Parse (role, text) messages from a byte chunk, preserving order."""
+    out = []
+    for m in MARKER_RE.finditer(chunk):
+        tp = m.group(1)
+        if tp not in (b'user', b'assistant'):
+            continue
+        line = _extract_line(chunk, m.start())
+        if tp == b'user':
+            if b'"isCompactSummary":true' in line:
+                continue
+            text = _parse_msg_text(line)
+            if text:
+                clean = _clean_user_text(text)
+                if clean:
+                    out.append(('user', clean))
+        else:
+            if b'"type":"text"' not in line:
+                continue
+            gems = _extract_gems(line)
+            if gems:
+                out.append(('assistant', ' '.join(gems.split())))
+    return out
+
+
+def _preview_header(sid, path, size, proj_dirname, data_head):
+    lines = [f"{DIM}─── {project_label(proj_dirname)} ─────────────────────{RESET}"]
+    ts = re.search(rb'"timestamp":"([^"]+)"', data_head)
+    if ts:
+        try:
+            dt = datetime.fromisoformat(ts.group(1).decode().replace('Z', '+00:00'))
+            lines.append(f"{DIM}Created: {dt.astimezone().strftime('%b %d, %Y')}{RESET}")
+        except ValueError:
+            pass
+    return lines
+
+
+def preview_output(sid, query=''):
+    """Print a conversation preview: opening user messages + latest state."""
+    found = _find_session_file(sid)
+    if not found:
+        print("Session file not found")
+        return
+    path, size, proj_dirname = found
+
+    capped = size > _PREVIEW_HEAD_CAP + _PREVIEW_TAIL_CAP
+    with open(path, 'rb') as f:
+        head = f.read(_PREVIEW_HEAD_CAP if capped else size)
+        tail = b''
+        if capped:
+            f.seek(size - _PREVIEW_TAIL_CAP)
+            tail = f.read()
+            nl = tail.find(b'\n')
+            tail = tail[nl + 1:] if nl != -1 else tail
+
+    for line in _preview_header(sid, path, size, proj_dirname, head):
+        print(line)
+    scanned = head + tail
+    approx = "≥" if capped else ""
+    msg_count = scanned.count(b'"type":"user"') + scanned.count(b'"type":"assistant"')
+    print(f"{DIM}Messages: {approx}{msg_count}{RESET}")
+    compacts = scanned.count(b'"subtype":"compact_boundary"')
+    is_fork = b'"isCompactSummary":true' in head[:2_000_000]
+    print()
+    if compacts:
+        print(f"\033[33m⚠ {compacts}x compacted — long session{RESET}")
+    if is_fork:
+        print(f"{GREEN}↪ continues an earlier session{RESET}")
+    if compacts or is_fork:
+        print()
+
+    if query.strip():
+        _preview_query(path, query)
+    else:
+        _preview_flow(head, tail, capped)
+
+
+def _preview_flow(head, tail, capped):
+    """Opening user messages, then the latest exchanges from the tail."""
+    head_msgs = _chunk_messages(head)
+    opening = [(r, t) for r, t in head_msgs if r == 'user'][:8]
+    for _, t in opening:
+        print(f"{CYAN}>{RESET} {t[:300]}")
+        print()
+
+    if not capped:
+        # Whole file parsed: show the closing assistant gem if any.
+        gems = [t for r, t in head_msgs if r == 'assistant']
+        if gems:
+            print(f"{DIM}— latest —{RESET}")
+            print(f"{DIM}·{RESET} {gems[-1][-300:]}")
+        return
+
+    tail_msgs = _chunk_messages(tail)
+    recent_users = [(r, t) for r, t in tail_msgs if r == 'user'][-3:]
+    gems = [t for r, t in tail_msgs if r == 'assistant']
+    if recent_users or gems:
+        print(f"{DIM}···{RESET}")
+        print(f"{DIM}— latest —{RESET}")
+        for _, t in recent_users:
+            print(f"{CYAN}>{RESET} {t[:300]}")
+            print()
+        if gems:
+            print(f"{DIM}·{RESET} {gems[-1][-300:]}")
+
+
+def _preview_query(path, query):
+    """Messages matching the query terms, term-highlighted, streaming scan."""
+    terms = [t.strip('"').lower() for t in query.split() if t.strip('"')]
+    if not terms:
+        return
+    pattern = re.compile('|'.join(re.escape(t) for t in terms).encode(), re.IGNORECASE)
+    hi = re.compile('|'.join(re.escape(t) for t in terms), re.IGNORECASE)
+    shown = 0
+    with open(path, 'rb') as f:
+        for line in f:
+            if shown >= 15:
+                break
+            if not pattern.search(line):
+                continue
+            is_user = b'"type":"user"' in line
+            is_asst = b'"type":"assistant"' in line and b'"type":"text"' in line
+            if not (is_user or is_asst):
+                continue
+            if is_user:
+                text = _parse_msg_text(line)
+                text = _clean_user_text(text) if text else None
+            else:
+                text = _extract_gems(line)
+                text = ' '.join(text.split()) if text else None
+            if not text or not hi.search(text):
+                continue
+            snippet = hi.sub(lambda m: f"{YELLOW}{m.group(0)}{RESET}", text[:300])
+            mark = f"{GREEN}▸{RESET}" if is_user else f"{CYAN}▹{RESET}"
+            print(f"{mark} {snippet}")
+            print()
+            shown += 1
+
+
 # --- TSV cache (for fzf no-query mode) ---
 
 def write_cache(conn, cache_path=None):
@@ -944,6 +1136,12 @@ def main():
     json_mode = "--json" in sys.argv
     search_query = _get_arg("--search")
     label = _get_arg("--label") or ''
+    preview_sid = _get_arg("--preview")
+
+    # Preview mode: conversation preview for one session (fzf pane / app)
+    if preview_sid:
+        preview_output(preview_sid, query=search_query or '')
+        return
 
     # JSON mode: rows for GUI front-ends (browse or search)
     if json_mode:

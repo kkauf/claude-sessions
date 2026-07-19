@@ -10,7 +10,9 @@ mkdir -p "$APP/Contents/MacOS"
 
 swiftc -O -swift-version 5 -o "$APP/Contents/MacOS/SessionPicker" SessionPicker.swift
 
-cat > "$APP/Contents/Info.plist" <<'EOF'
+# RepoPath tells the app where the CLI + indexer live (this clone), so any
+# clone location works without configuration.
+cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -20,6 +22,7 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
     <key>CFBundleExecutable</key><string>SessionPicker</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>1.0</string>
+    <key>RepoPath</key><string>$PWD</string>
     <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>
 </dict>

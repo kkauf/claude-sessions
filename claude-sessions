@@ -265,17 +265,27 @@ if [[ "${1:-}" == "open" ]]; then
     printf 'cd %q && %q --resume %q\n' "$resume_dir" "$CLAUDE_BIN" "$session_id"
     exit 0
   fi
-  osascript <<EOF
+  resume_cmd="cd $(printf '%q' "$resume_dir") && $(printf '%q' "$CLAUDE_BIN") --resume $(printf '%q' "$session_id")"
+  if [[ -d /Applications/iTerm.app || -d "$HOME/Applications/iTerm.app" ]]; then
+    osascript <<EOF
 tell application "iTerm"
     activate
     set newWindow to (create window with default profile)
     tell newWindow
         tell current session
-            write text "cd $(printf '%q' "$resume_dir") && $(printf '%q' "$CLAUDE_BIN") --resume $(printf '%q' "$session_id")"
+            write text "$resume_cmd"
         end tell
     end tell
 end tell
 EOF
+  else
+    osascript <<EOF
+tell application "Terminal"
+    activate
+    do script "$resume_cmd"
+end tell
+EOF
+  fi
   exit 0
 fi
 

@@ -13,7 +13,7 @@ Fast session picker for [Claude Code](https://docs.anthropic.com/en/docs/claude-
 - **BM25 ranking** — title matches (10x) outrank preview matches (5x) outrank body matches (1x). Short tokens, numbers, and special characters all work.
 - **Live re-search** — typing updates results via FTS5 query (not fzf fuzzy filtering). Results are fully replaced and re-ranked on every keystroke.
 - **Smart extraction** — indexes user messages + assistant text blocks (first and last per response). Skips tool calls, file reads, and JSON noise.
-- **Query-matched preview** — right panel shows messages containing your search terms
+- **Signal-aware preview** — right panel shows the conversation's opening user messages plus a "latest" section (recent messages + closing assistant remark) so you see both what it's about and where it left off. System-reminders, hook output, command echoes, image-only messages, and tool noise are filtered. While searching, the preview switches to query-matched messages with the terms highlighted.
 - **Advanced queries** — exact phrases (`"auth bug"`), project filter (`--project kh`), negation (`-standup`)
 - **Cross-project** — searches all projects, shows project labels for context
 - **Relative dates** — "today", "1d", "2w", "3mo" — based on the last *message* timestamp, not file mtime (Claude Code touches session files on mere open, which would resurrect dead sessions)
@@ -32,10 +32,12 @@ Fast session picker for [Claude Code](https://docs.anthropic.com/en/docs/claude-
 
 ```bash
 git clone https://github.com/kkauf/claude-sessions.git
-ln -s "$(pwd)/claude-sessions/claude-sessions" /usr/local/bin/claude-sessions
+cd claude-sessions
+./install.sh          # links the CLI into PATH + builds the initial index
+./install.sh --app    # …and also builds + installs SessionPicker.app (macOS)
 ```
 
-The indexer (`session_indexer.py`) must be in the same directory as the main script.
+`install.sh` is idempotent — re-run it after `git pull` (it re-indexes so new columns backfill). Resume opens in iTerm2 when installed, otherwise Terminal.app.
 
 ## Usage
 

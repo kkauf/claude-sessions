@@ -299,9 +299,11 @@ assert_eq "search results have 7 TSV fields" "7" "$format_fields"
 echo ""
 echo "=== Preview Tests ==="
 
-# Use the real session-preview.sh with SESSION_PROJECTS_DIR override
+# Use the real session-preview.sh with SESSION_PROJECTS_DIR override.
+# ANSI is stripped so assertions match across term-highlight boundaries
+# (query terms are wrapped in color codes mid-phrase).
 run_preview() {
-  SESSION_PROJECTS_DIR="$PROJECTS" bash "$SCRIPT_DIR/session-preview.sh" "$@"
+  SESSION_PROJECTS_DIR="$PROJECTS" bash "$SCRIPT_DIR/session-preview.sh" "$@" | sed $'s/\x1b\\[[0-9;]*m//g'
 }
 
 # Test: Preview without query shows user messages
