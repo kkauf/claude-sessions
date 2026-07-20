@@ -401,15 +401,17 @@ min_path_out=$(env -i HOME="$HOME" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
 assert_contains "open --print works under minimal GUI PATH" "resume session-001" "$min_path_out"
 
 # --gui writes a self-deleting .command runner (intercept 'open' via PATH stub).
-# The runner path is the LAST arg: 'open -a iTerm <runner>' when iTerm is
-# installed, plain 'open <runner>' otherwise.
+# iTerm is always tried first, resolved by NAME via LaunchServices — never by
+# bundle path (iTerm can live in /Applications/Utilities, ~/Applications, …).
 STUB_DIR="$TMPDIR/stubs"
 mkdir -p "$STUB_DIR"
-printf '#!/bin/bash\necho "OPENED:${@: -1}" >> "%s/opened.log"\n' "$TMPDIR" > "$STUB_DIR/open"
+printf '#!/bin/bash\necho "OPENED:$*" >> "%s/opened.log"\n' "$TMPDIR" > "$STUB_DIR/open"
 chmod +x "$STUB_DIR/open"
 gui_out=$(SESSION_PROJECTS_DIR="$OPEN_PROJECTS" PATH="$STUB_DIR:$PATH" bash "$SCRIPT_DIR/claude-sessions" open session-001 --gui 2>&1 || true)
 if [[ -f "$TMPDIR/opened.log" ]]; then
-  runner_path=$(head -1 "$TMPDIR/opened.log" | cut -d: -f2)
+  gui_line=$(head -1 "$TMPDIR/opened.log")
+  assert_contains "gui resume prefers iTerm by LaunchServices name" "-a iTerm" "$gui_line"
+  runner_path="${gui_line##* }"
   assert_contains "gui runner is a .command file" ".command" "$runner_path"
   runner_body=$(cat "$runner_path" 2>/dev/null || echo missing)
   assert_contains "gui runner cds to session dir" "cd /tmp" "$runner_body"
