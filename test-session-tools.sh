@@ -392,6 +392,14 @@ else
   echo "PASS: open without sid exits nonzero"; PASS=$((PASS+1))
 fi
 
+# Dock-launched GUI apps inherit a minimal PATH without Homebrew — the script
+# must bootstrap its own dependency dirs (regression: 'fzf required' alert on
+# Enter in SessionPicker.app even with fzf installed).
+min_path_out=$(env -i HOME="$HOME" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+  SESSION_PROJECTS_DIR="$OPEN_PROJECTS" \
+  bash "$SCRIPT_DIR/claude-sessions" open session-001 --print 2>&1 || true)
+assert_contains "open --print works under minimal GUI PATH" "resume session-001" "$min_path_out"
+
 # --gui writes a self-deleting .command runner (intercept 'open' via PATH stub).
 # The runner path is the LAST arg: 'open -a iTerm <runner>' when iTerm is
 # installed, plain 'open <runner>' otherwise.

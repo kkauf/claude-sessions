@@ -21,4 +21,11 @@ export SESSION_DB_PATH="$PWD/demo/sessions.db"
 export SESSION_CACHE_PATH="$PWD/demo/cache.tsv"
 python3 session_indexer.py >/dev/null
 
-SP_SELFTEST=1 SP_OPAQUE=1 ./SessionPicker.app/Contents/MacOS/SessionPicker
+# Run under a Dock-like minimal environment: LaunchServices launches apps
+# WITHOUT Homebrew/user PATH entries, and a terminal-inherited PATH would
+# hide dependency-resolution bugs (the 'fzf required' alert regression).
+env -i HOME="$HOME" PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+  SESSION_PROJECTS_DIR="$PWD/demo/projects" \
+  SESSION_DB_PATH="$PWD/demo/sessions.db" \
+  SESSION_CACHE_PATH="$PWD/demo/cache.tsv" \
+  SP_SELFTEST=1 SP_OPAQUE=1 ./SessionPicker.app/Contents/MacOS/SessionPicker

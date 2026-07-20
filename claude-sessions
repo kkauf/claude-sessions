@@ -7,6 +7,12 @@
 
 shopt -s nullglob
 
+# GUI front-ends (SessionPicker.app via Dock/LaunchServices) inherit a minimal
+# PATH without Homebrew or user bin dirs — make dependencies findable anyway.
+for d in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin"; do
+  if [[ -d "$d" && ":$PATH:" != *":$d:"* ]]; then PATH="$PATH:$d"; fi
+done
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLAUDE_PROJECTS="${SESSION_PROJECTS_DIR:-$HOME/.claude/projects}"
 UNIFIED_CACHE="${SESSION_CACHE_PATH:-$HOME/.claude/.sessions-unified-cache.tsv}"
@@ -121,7 +127,10 @@ if [[ "${1:-}" == "snapshot" ]]; then
   exit 0
 fi
 
-for cmd in fzf jq python3; do
+# 'open' is headless resume — it never renders the picker, so fzf isn't needed.
+required=(fzf jq python3)
+[[ "${1:-}" == "open" ]] && required=(jq)
+for cmd in "${required[@]}"; do
   command -v "$cmd" &>/dev/null || { echo "$cmd required. Install: brew install $cmd (macOS) or apt install $cmd (Linux)" >&2; exit 1; }
 done
 
