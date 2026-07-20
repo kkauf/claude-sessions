@@ -128,13 +128,37 @@ final class Bridge {
         do { try p.run() } catch { done() }
     }
 
-    func open(sid: String) {
+    /// Resume via `claude-sessions open <sid> --gui` (.command + LaunchServices —
+    /// no AppleEvents, so no Automation permission can silently break it).
+    /// Reports failure so the UI can show it instead of doing nothing.
+    func open(sid: String, done: @escaping (Int32, String) -> Void) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: Paths.opener)
-        p.arguments = ["open", sid]
+        p.arguments = ["open", sid, "--gui"]
+        let err = Pipe()
         p.standardOutput = FileHandle.nullDevice
+        p.standardError = err
+        p.terminationHandler = { proc in
+            let msg = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            DispatchQueue.main.async { done(proc.terminationStatus, msg) }
+        }
+        do { try p.run() } catch {
+            done(-1, "could not launch \(Paths.opener): \(error.localizedDescription)")
+        }
+    }
+
+    /// Synchronous helper for the self-test: run the opener and capture stdout.
+    func openPrint(sid: String) -> (Int32, String) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: Paths.opener)
+        p.arguments = ["open", sid, "--print"]
+        let out = Pipe()
+        p.standardOutput = out
         p.standardError = FileHandle.nullDevice
-        try? p.run()
+        do { try p.run() } catch { return (-1, "") }
+        p.waitUntilExit()
+        let s = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        return (p.terminationStatus, s)
     }
 }
 
@@ -258,8 +282,10 @@ final class PickerController: NSObject, NSTextFieldDelegate, NSTableViewDataSour
                 y: s.visibleFrame.minY + s.visibleFrame.height * 0.58))
         }
         field.stringValue = ""
-        panel.makeKeyAndOrderFront(nil)
+        // Activate BEFORE ordering front: showing while inactive lets
+        // hidesOnDeactivate dismiss the panel instantly (launch "flash").
         NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
         panel.makeFirstResponder(field)
         refresh()
         // Pick up new/changed sessions in the background, then refresh once.
@@ -339,7 +365,18 @@ final class PickerController: NSObject, NSTextFieldDelegate, NSTableViewDataSour
     @objc func openSelected() {
         let i = table.selectedRow
         guard i >= 0, i < rows.count else { return }
-        bridge.open(sid: rows[i].sid)
+        let sid = rows[i].sid
+        bridge.open(sid: sid) { status, err in
+            guard status != 0 else { return }
+            // Never fail silently — that reads as "the app is broken".
+            NSApp.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            alert.messageText = "Could not resume session"
+            alert.informativeText = err.isEmpty
+                ? "claude-sessions open exited with status \(status)."
+                : err.trimmingCharacters(in: .whitespacesAndNewlines)
+            alert.runModal()
+        }
         hide()
     }
 
@@ -397,11 +434,29 @@ let controller = PickerController()
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var hotKeyRef: EventHotKeyRef?
+    var hasShownOnce = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.applicationIconImage = Self.dockIcon()
         registerHotKeyIfConfigured()
-        controller.show()
+        if ProcessInfo.processInfo.environment["SP_SELFTEST"] != nil {
+            hasShownOnce = true
+            SelfTest.run()
+        }
+        // No show() here: at launch the app may not be active yet, and a
+        // panel shown while inactive is dismissed by hidesOnDeactivate the
+        // moment anything else has focus — the "flashes then nothing" bug.
+        // The first show happens in applicationDidBecomeActive.
+    }
+
+    /// First activation (Dock/Finder launch, open -a) shows the panel.
+    /// Launching as a Login Item does NOT activate — so no panel pops at
+    /// login; the first Dock click brings it up.
+    func applicationDidBecomeActive(_ notification: Notification) {
+        if !hasShownOnce {
+            hasShownOnce = true
+            if !controller.panel.isVisible { controller.show() }
+        }
     }
 
     /// Clicking the Dock icon (or `open -a SessionPicker`) toggles the panel.
@@ -457,6 +512,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         img.unlockFocus()
         return img
+    }
+}
+
+// MARK: - Self-test (SP_SELFTEST=1, driven by test-app.sh)
+//
+// End-to-end smoke test through the real UI objects: panel shows, the indexer
+// returns rows, the preview renders for the selection, and the opener resolves
+// a resume command. Exits 0 on PASS, 1 on FAIL, 2 on watchdog timeout.
+
+enum SelfTest {
+    static func run() {
+        controller.show()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15) {
+            print("SELFTEST FAIL: watchdog timeout")
+            exit(2)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { verify() }
+    }
+
+    static func verify() {
+        guard !controller.rows.isEmpty else {
+            print("SELFTEST FAIL: no rows loaded (indexer bridge broken?)")
+            exit(1)
+        }
+        guard controller.panel.isVisible else {
+            print("SELFTEST FAIL: panel not visible after show()")
+            exit(1)
+        }
+        let preview = controller.previewView.string
+        guard !preview.isEmpty else {
+            print("SELFTEST FAIL: empty preview for selected row")
+            exit(1)
+        }
+        let sid = controller.rows[0].sid
+        DispatchQueue.global().async {
+            let (status, out) = controller.bridge.openPrint(sid: sid)
+            DispatchQueue.main.async {
+                guard status == 0, out.contains("--resume") else {
+                    print("SELFTEST FAIL: open --print status=\(status) output=\(out)")
+                    exit(1)
+                }
+                print("SELFTEST PASS: \(controller.rows.count) rows, preview \(preview.count) chars, resume: \(out.trimmingCharacters(in: .whitespacesAndNewlines))")
+                exit(0)
+            }
+        }
     }
 }
 

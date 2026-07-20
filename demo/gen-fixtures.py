@@ -60,6 +60,9 @@ def title(name):
 def write_session(project, sid, lines, filler_kb=0):
     d = os.path.join(BASE, f"-{HOME_KEY}-{project}")
     os.makedirs(d, exist_ok=True)
+    # Record a cwd like real transcripts do — resume-dir resolution needs it.
+    cwd = os.path.expanduser("~") + "/" + project.replace("github-", "github/", 1)
+    lines = [lines[0], json.dumps({"type": "system", "cwd": cwd})] + lines[1:]
     with open(os.path.join(d, f"{sid}.jsonl"), "w") as f:
         f.write("\n".join(lines) + "\n")
         for _ in range(filler_kb * 1024 // (len(FILLER) + 1)):

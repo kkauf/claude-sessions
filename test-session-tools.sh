@@ -362,6 +362,54 @@ assert_contains "preview shows created date" "Created:" "$preview_no_query"
 # Test: Metadata header shows horizontal rule
 assert_contains "preview shows header rule" "───" "$preview_no_query"
 
+# --- OPEN COMMAND TESTS (last: resolution may relocate transcripts) ---
+
+echo ""
+echo "=== Open Command Tests ==="
+
+# Copied fixture set so relocation side-effects can't touch earlier fixtures.
+OPEN_PROJECTS="$TMPDIR/open-projects"
+mkdir -p "$OPEN_PROJECTS"
+cp -R "$PROJECTS/." "$OPEN_PROJECTS/"
+
+run_open() {
+  SESSION_PROJECTS_DIR="$OPEN_PROJECTS" bash "$SCRIPT_DIR/claude-sessions" open "$@" 2>&1
+}
+
+# session-001 records cwd "/tmp" (exists) — resolution lands there.
+open_print=$(run_open session-001 --print || true)
+assert_contains "open --print resolves recorded cwd" "cd /tmp" "$open_print"
+assert_contains "open --print emits resume command" "claude --resume session-001" "$open_print"
+
+# Unknown sid: documented behavior — stay in the current dir, let claude report.
+open_missing=$(run_open session-nonexistent --print || true)
+assert_contains "open --print unknown sid falls back to cwd" "--resume session-nonexistent" "$open_missing"
+
+# No sid: usage error, nonzero exit.
+if SESSION_PROJECTS_DIR="$OPEN_PROJECTS" bash "$SCRIPT_DIR/claude-sessions" open >/dev/null 2>&1; then
+  echo "FAIL: open without sid should exit nonzero"; FAIL=$((FAIL+1))
+else
+  echo "PASS: open without sid exits nonzero"; PASS=$((PASS+1))
+fi
+
+# --gui writes a self-deleting .command runner (intercept 'open' via PATH stub).
+STUB_DIR="$TMPDIR/stubs"
+mkdir -p "$STUB_DIR"
+printf '#!/bin/bash\necho "OPENED:$1" >> "%s/opened.log"\n' "$TMPDIR" > "$STUB_DIR/open"
+chmod +x "$STUB_DIR/open"
+gui_out=$(SESSION_PROJECTS_DIR="$OPEN_PROJECTS" PATH="$STUB_DIR:$PATH" bash "$SCRIPT_DIR/claude-sessions" open session-001 --gui 2>&1 || true)
+if [[ -f "$TMPDIR/opened.log" ]]; then
+  runner_path=$(head -1 "$TMPDIR/opened.log" | cut -d: -f2)
+  assert_contains "gui runner is a .command file" ".command" "$runner_path"
+  runner_body=$(cat "$runner_path" 2>/dev/null || echo missing)
+  assert_contains "gui runner cds to session dir" "cd /tmp" "$runner_body"
+  assert_contains "gui runner execs claude --resume" "resume session-001" "$runner_body"
+  assert_contains "gui runner self-deletes" "rm -f" "$runner_body"
+  rm -f "$runner_path"
+else
+  echo "FAIL: --gui never invoked LaunchServices open"; FAIL=$((FAIL+1))
+fi
+
 # --- RESULTS ---
 
 echo ""

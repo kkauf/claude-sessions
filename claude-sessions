@@ -245,12 +245,16 @@ if [[ -n "${CLAUDE_SESSIONS_LIB:-}" ]]; then
 fi
 
 # --- open command (headless resume — used by GUI front-ends) ---
-# claude-sessions open <sid>          resolve dir, open iTerm, resume
+# claude-sessions open <sid>          resolve dir, open a terminal via AppleScript
 # claude-sessions open <sid> --print  print the resume command instead
+# claude-sessions open <sid> --gui    resume via a .command file + LaunchServices.
+#     No AppleEvents involved — AppleScript from a GUI app needs an Automation
+#     grant tied to its code signature (rotates on ad-hoc rebuilds), which
+#     fails silently when missing. SessionPicker.app always uses --gui.
 if [[ "${1:-}" == "open" ]]; then
   session_id="${2:-}"
   if [[ -z "$session_id" ]]; then
-    echo "usage: claude-sessions open <session-id> [--print]" >&2
+    echo "usage: claude-sessions open <session-id> [--print|--gui]" >&2
     exit 1
   fi
   if ! resume_dir=$(resolve_resume_dir "$session_id"); then
@@ -263,6 +267,19 @@ if [[ "${1:-}" == "open" ]]; then
   fi
   if [[ "${3:-}" == "--print" ]]; then
     printf 'cd %q && %q --resume %q\n' "$resume_dir" "$CLAUDE_BIN" "$session_id"
+    exit 0
+  fi
+  if [[ "${3:-}" == "--gui" ]]; then
+    runner_base=$(mktemp -t claude-resume)
+    runner="$runner_base.command"
+    mv "$runner_base" "$runner"
+    {
+      echo '#!/bin/bash'
+      printf 'rm -f -- %q\n' "$runner"
+      printf 'cd %q && exec %q --resume %q\n' "$resume_dir" "$CLAUDE_BIN" "$session_id"
+    } > "$runner"
+    chmod +x "$runner"
+    open "$runner" || { echo "claude-sessions: could not open $runner via LaunchServices." >&2; exit 1; }
     exit 0
   fi
   resume_cmd="cd $(printf '%q' "$resume_dir") && $(printf '%q' "$CLAUDE_BIN") --resume $(printf '%q' "$session_id")"
