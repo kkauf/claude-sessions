@@ -279,6 +279,11 @@ if [[ "${1:-}" == "open" ]]; then
       printf 'cd %q && exec %q --resume %q\n' "$resume_dir" "$CLAUDE_BIN" "$session_id"
     } > "$runner"
     chmod +x "$runner"
+    # Prefer iTerm2 when installed (it executes .command files); otherwise the
+    # system default handler (Terminal.app out of the box).
+    if [[ -d /Applications/iTerm.app || -d "$HOME/Applications/iTerm.app" ]]; then
+      open -a iTerm "$runner" 2>/dev/null && exit 0
+    fi
     open "$runner" || { echo "claude-sessions: could not open $runner via LaunchServices." >&2; exit 1; }
     exit 0
   fi

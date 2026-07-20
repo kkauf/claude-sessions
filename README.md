@@ -148,7 +148,7 @@ A native Spotlight-style panel over the same index — one Swift file, no Xcode 
 Keep it in the Dock (right-click → Options → Keep in Dock); clicking the icon toggles the panel. Optionally add it as a Login Item (System Settings → General → Login Items).
 
 - **Triggers**: Dock icon click, or `open -a SessionPicker` (bind that to anything). Launching as a Login Item stays quiet — the panel first appears on your first Dock click.
-- **Resume mechanics**: `Enter` writes a one-shot `.command` file and opens it via LaunchServices — no AppleScript, no Automation permission to grant (or to silently lose). It runs in your default `.command` handler (Terminal.app unless you've set iTerm: Get Info on any `.command` file → Open With → iTerm → Change All). Failures surface as an alert, never silently.
+- **Resume mechanics**: `Enter` writes a one-shot `.command` file and opens it via LaunchServices — no AppleScript, no Automation permission to grant (or to silently lose). It runs in iTerm2 when installed, otherwise your default `.command` handler (Terminal.app). Failures surface as an alert, never silently.
 - **Global hotkey (opt-in, off by default)**: `defaults write earth.kaufmann.SessionPicker HotKeyCode -int 49 && defaults write earth.kaufmann.SessionPicker HotKeyMods -int 2048` (Carbon codes; 49+2048 = ⌥Space), then relaunch. If another app owns the combo (Raycast, Spotlight), registration fails — check `log show --last 5m --predicate 'process == "SessionPicker"'`.
 - **Paths**: override with `defaults write earth.kaufmann.SessionPicker IndexerPath|OpenerPath|PreviewPath|PythonPath <path>` if the repo doesn't live at `~/github/claude-sessions`.
 

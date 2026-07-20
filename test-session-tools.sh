@@ -393,9 +393,11 @@ else
 fi
 
 # --gui writes a self-deleting .command runner (intercept 'open' via PATH stub).
+# The runner path is the LAST arg: 'open -a iTerm <runner>' when iTerm is
+# installed, plain 'open <runner>' otherwise.
 STUB_DIR="$TMPDIR/stubs"
 mkdir -p "$STUB_DIR"
-printf '#!/bin/bash\necho "OPENED:$1" >> "%s/opened.log"\n' "$TMPDIR" > "$STUB_DIR/open"
+printf '#!/bin/bash\necho "OPENED:${@: -1}" >> "%s/opened.log"\n' "$TMPDIR" > "$STUB_DIR/open"
 chmod +x "$STUB_DIR/open"
 gui_out=$(SESSION_PROJECTS_DIR="$OPEN_PROJECTS" PATH="$STUB_DIR:$PATH" bash "$SCRIPT_DIR/claude-sessions" open session-001 --gui 2>&1 || true)
 if [[ -f "$TMPDIR/opened.log" ]]; then
