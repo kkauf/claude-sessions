@@ -407,7 +407,8 @@ STUB_DIR="$TMPDIR/stubs"
 mkdir -p "$STUB_DIR"
 printf '#!/bin/bash\necho "OPENED:$*" >> "%s/opened.log"\n' "$TMPDIR" > "$STUB_DIR/open"
 chmod +x "$STUB_DIR/open"
-gui_out=$(SESSION_PROJECTS_DIR="$OPEN_PROJECTS" PATH="$STUB_DIR:$PATH" bash "$SCRIPT_DIR/claude-sessions" open session-001 --gui 2>&1 || true)
+MARKER="$TMPDIR/pending-marker"
+gui_out=$(SESSION_PROJECTS_DIR="$OPEN_PROJECTS" SESSION_PENDING_MARKER="$MARKER" PATH="$STUB_DIR:$PATH" bash "$SCRIPT_DIR/claude-sessions" open session-001 --gui 2>&1 || true)
 if [[ -f "$TMPDIR/opened.log" ]]; then
   gui_line=$(head -1 "$TMPDIR/opened.log")
   assert_contains "gui resume prefers iTerm by LaunchServices name" "-a iTerm" "$gui_line"
@@ -417,10 +418,30 @@ if [[ -f "$TMPDIR/opened.log" ]]; then
   assert_contains "gui runner cds to session dir" "cd /tmp" "$runner_body"
   assert_contains "gui runner execs claude --resume" "resume session-001" "$runner_body"
   assert_contains "gui runner self-deletes" "rm -f" "$runner_body"
-  rm -f "$runner_path"
+  # iTerm TYPES the runner path instead of executing it (README caveat) — the
+  # marker is the handshake letting custom-command default profiles catch it.
+  marker_content=$(cat "$MARKER" 2>/dev/null || echo missing)
+  assert_eq "gui marker names the runner" "$runner_path" "$marker_content"
+  rm -f "$runner_path" "$MARKER"
 else
   echo "FAIL: --gui never invoked LaunchServices open"; FAIL=$((FAIL+1))
 fi
+
+# When iTerm isn't installed, the fallback handler (Terminal.app) executes the
+# .command file directly — no typed input is coming, so the marker must be
+# removed rather than left to confuse the next default-profile session.
+printf '#!/bin/bash\nif [[ "$*" == *"-a iTerm"* ]]; then exit 1; fi\necho "OPENED:$*" >> "%s/opened.log"\n' "$TMPDIR" > "$STUB_DIR/open"
+chmod +x "$STUB_DIR/open"
+rm -f "$TMPDIR/opened.log"
+gui_out=$(SESSION_PROJECTS_DIR="$OPEN_PROJECTS" SESSION_PENDING_MARKER="$MARKER" PATH="$STUB_DIR:$PATH" bash "$SCRIPT_DIR/claude-sessions" open session-001 --gui 2>&1 || true)
+fallback_line=$(head -1 "$TMPDIR/opened.log" 2>/dev/null || echo missing)
+assert_not_contains "gui falls back past iTerm" "-a iTerm" "$fallback_line"
+if [[ -f "$MARKER" ]]; then
+  echo "FAIL: marker should be removed when falling back to the default handler"; FAIL=$((FAIL+1))
+else
+  PASS=$((PASS+1))
+fi
+rm -f "${fallback_line#OPENED:}" 2>/dev/null || true
 
 # --- RESULTS ---
 

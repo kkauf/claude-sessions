@@ -288,11 +288,23 @@ if [[ "${1:-}" == "open" ]]; then
       printf 'cd %q && exec %q --resume %q\n' "$resume_dir" "$CLAUDE_BIN" "$session_id"
     } > "$runner"
     chmod +x "$runner"
-    # Prefer iTerm2 when installed (it executes .command files). Resolve by
-    # name via LaunchServices — the bundle can live anywhere (Utilities/,
-    # ~/Applications, …), so path checks are wrong. If iTerm isn't installed,
-    # 'open -a' exits nonzero and we fall back to the default handler.
+    # Prefer iTerm2 when installed. Resolve by name via LaunchServices — the
+    # bundle can live anywhere (Utilities/, ~/Applications, …), so path checks
+    # are wrong. If iTerm isn't installed, 'open -a' exits nonzero and we fall
+    # back to the default handler.
+    #
+    # iTerm doesn't execute .command files — it TYPES "<runner>; exit" into a
+    # new default-profile session after an unpredictable delay. A default
+    # profile that runs a custom command (not a shell) can't execute typed
+    # input on its own, so leave a marker naming the runner: the custom
+    # command can wait for the typed line when the marker is fresh, or run
+    # the runner itself if the line never arrives (see README).
+    pending_marker="${SESSION_PENDING_MARKER:-$HOME/.claude/.resume-pending-command}"
+    printf '%s\n' "$runner" > "$pending_marker"
     open -a iTerm "$runner" 2>/dev/null && exit 0
+    # Fallback handler (Terminal.app) executes .command files directly — no
+    # typed input is coming, so the marker must not linger.
+    rm -f "$pending_marker"
     open "$runner" || { echo "claude-sessions: could not open $runner via LaunchServices." >&2; exit 1; }
     exit 0
   fi
