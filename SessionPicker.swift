@@ -492,26 +492,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Runtime-drawn Dock icon — no asset files to ship.
-    static func dockIcon() -> NSImage {
-        let size = NSSize(width: 512, height: 512)
-        let img = NSImage(size: size)
-        img.lockFocus()
-        let rect = NSRect(origin: .zero, size: size).insetBy(dx: 40, dy: 40)
-        let bg = NSBezierPath(roundedRect: rect, xRadius: 96, yRadius: 96)
+    /// Icon artwork — single source of truth for the runtime Dock icon AND the
+    /// bundle's AppIcon.icns (via --dump-iconset in build-app.sh). No asset
+    /// files to ship; the .icns exists so a pinned Dock tile still shows the
+    /// logo when the app isn't running.
+    static func drawIcon(in canvas: NSRect) {
+        let k = canvas.width / 512
+        let rect = canvas.insetBy(dx: 40 * k, dy: 40 * k)
+        let bg = NSBezierPath(roundedRect: rect, xRadius: 96 * k, yRadius: 96 * k)
         NSColor(calibratedRed: 0.85, green: 0.47, blue: 0.34, alpha: 1.0).setFill()  // Claude terracotta
         bg.fill()
         if let sym = NSImage(systemSymbolName: "bubble.left.and.bubble.right.fill",
                              accessibilityDescription: nil)?
-            .withSymbolConfiguration(.init(pointSize: 240, weight: .medium)
+            .withSymbolConfiguration(.init(pointSize: 240 * k, weight: .medium)
                 .applying(.init(paletteColors: [.white]))) {
             let s = sym.size
-            let scale = min(280 / s.width, 280 / s.height)
+            let scale = min(280 * k / s.width, 280 * k / s.height)
             let w = s.width * scale, h = s.height * scale
-            sym.draw(in: NSRect(x: (512 - w) / 2, y: (512 - h) / 2, width: w, height: h))
+            sym.draw(in: NSRect(x: canvas.minX + (canvas.width - w) / 2,
+                                y: canvas.minY + (canvas.height - h) / 2, width: w, height: h))
         }
+    }
+
+    static func dockIcon() -> NSImage {
+        let img = NSImage(size: NSSize(width: 512, height: 512))
+        img.lockFocus()
+        drawIcon(in: NSRect(x: 0, y: 0, width: 512, height: 512))
         img.unlockFocus()
         return img
+    }
+
+    /// Render the icon at exact pixel sizes into an .iconset directory.
+    static func writeIconset(to dir: String) throws {
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let sizes: [(Int, String)] = [(128, "icon_128x128"), (256, "icon_256x256"),
+                                      (512, "icon_512x512"), (1024, "icon_512x512@2x")]
+        for (px, name) in sizes {
+            guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px,
+                                             bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                             isPlanar: false, colorSpaceName: .calibratedRGB,
+                                             bytesPerRow: 0, bitsPerPixel: 0),
+                  let ctx = NSGraphicsContext(bitmapImageRep: rep) else {
+                throw NSError(domain: "SessionPicker", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "could not create bitmap for \(name)"])
+            }
+            rep.size = NSSize(width: px, height: px)
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = ctx
+            drawIcon(in: NSRect(x: 0, y: 0, width: px, height: px))
+            NSGraphicsContext.restoreGraphicsState()
+            guard let png = rep.representation(using: .png, properties: [:]) else {
+                throw NSError(domain: "SessionPicker", code: 2,
+                              userInfo: [NSLocalizedDescriptionKey: "could not encode \(name)"])
+            }
+            try png.write(to: URL(fileURLWithPath: dir).appendingPathComponent("\(name).png"))
+        }
     }
 }
 
@@ -561,6 +596,19 @@ enum SelfTest {
 }
 
 let app = NSApplication.shared
+
+// Build-time hook: render the icon artwork into an .iconset directory
+// (build-app.sh turns it into AppIcon.icns). Not a user-facing flag.
+if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--dump-iconset" {
+    do {
+        try AppDelegate.writeIconset(to: CommandLine.arguments[2])
+        exit(0)
+    } catch {
+        FileHandle.standardError.write("iconset dump failed: \(error.localizedDescription)\n".data(using: .utf8)!)
+        exit(1)
+    }
+}
+
 app.setActivationPolicy(.regular)  // Dock icon = the default trigger
 let delegate = AppDelegate()
 app.delegate = delegate
