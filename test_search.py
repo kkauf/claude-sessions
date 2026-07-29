@@ -10,7 +10,7 @@ Run: python3 test_search.py
 import os, sys, tempfile, unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
-from session_indexer import init_db, index_session, search, lineage_info
+from session_indexer import init_db, index_session, search, lineage_info, _resolve_duplicates
 
 
 class SearchTestCase(unittest.TestCase):
@@ -345,6 +345,73 @@ class TestForkLineage(SearchTestCase):
         self.link('id2', 'id1')
         _, _, cum = lineage_info(self.conn)
         self.assertEqual(cum['id2'], 107)
+
+
+class TestDuplicateContinuations(SearchTestCase):
+    """Unmarked continuations (same first message uuid) collapse like forks.
+
+    Newer Claude Code can copy a conversation into a fresh session id with no
+    compact_boundary at all; the copy keeps its original message uuids.
+    """
+
+    def add_fam(self, sid, fuuid, mtime, project='test', body=''):
+        index_session(self.conn, sid, '', '', body or f'content {sid}', project,
+                      100, mtime, first_uuid=fuuid)
+        self.conn.commit()
+
+    def test_duplicate_family_links_and_hides_older(self):
+        self.add_fam('olddup', 'aaaaaaaa-0000-0000-0000-000000000001', 1000)
+        self.add_fam('newdup', 'aaaaaaaa-0000-0000-0000-000000000001', 2000)
+        _resolve_duplicates(self.conn)
+        hidden, terminal_of, _ = lineage_info(self.conn)
+        self.assertIn('olddup', hidden)
+        self.assertEqual(terminal_of['olddup'], 'newdup')
+
+    def test_search_redirects_duplicate_to_newest(self):
+        self.add_fam('olddup', 'bbbbbbbb-0000-0000-0000-000000000001', 1000,
+                     body='quantum shark research')
+        self.add_fam('newdup', 'bbbbbbbb-0000-0000-0000-000000000001', 2000,
+                     body='unrelated continuation')
+        _resolve_duplicates(self.conn)
+        self.assertEqual(self.all_sids('shark'), ['newdup'])
+
+    def test_different_families_untouched(self):
+        self.add_fam('s1', 'cccccccc-0000-0000-0000-000000000001', 1000)
+        self.add_fam('s2', 'dddddddd-0000-0000-0000-000000000001', 2000)
+        _resolve_duplicates(self.conn)
+        hidden, _, _ = lineage_info(self.conn)
+        self.assertEqual(hidden, set())
+
+    def test_real_compact_edge_not_overwritten(self):
+        self.add_fam('parent', 'eeeeeeee-0000-0000-0000-000000000001', 1000)
+        index_session(self.conn, 'child', '', '', 'x', 'test', 100, 2000, is_fork=1,
+                      parent_uuid='real-uuid', first_uuid='eeeeeeee-0000-0000-0000-000000000001')
+        self.conn.execute("UPDATE sessions SET parent_sid='parent' WHERE sid='child'")
+        self.conn.commit()
+        _resolve_duplicates(self.conn)
+        row = self.conn.execute(
+            "SELECT parent_uuid, parent_sid FROM sessions WHERE sid='child'").fetchone()
+        self.assertEqual(row, ('real-uuid', 'parent'))
+
+    def test_worktree_family_matches_base_project(self):
+        self.add_fam('a1', 'ffffffff-0000-0000-0000-000000000001', 1000, project='repo')
+        self.add_fam('a2', 'ffffffff-0000-0000-0000-000000000001', 2000,
+                     project='repo--claude-worktrees-x')
+        _resolve_duplicates(self.conn)
+        hidden, terminal_of, _ = lineage_info(self.conn)
+        self.assertIn('a1', hidden)
+        self.assertEqual(terminal_of['a1'], 'a2')
+
+    def test_revived_older_duplicate_shows_again(self):
+        """Resuming the superseded copy makes it a live branch — show both."""
+        self.add_fam('olddup2', 'abababab-0000-0000-0000-000000000001', 1000)
+        self.add_fam('newdup2', 'abababab-0000-0000-0000-000000000001', 2000)
+        _resolve_duplicates(self.conn)
+        self.conn.execute(
+            "UPDATE sessions SET last_activity_epoch = 3000 WHERE sid = 'olddup2'")
+        self.conn.commit()
+        hidden, _, _ = lineage_info(self.conn)
+        self.assertEqual(hidden, set())
 
 
 if __name__ == '__main__':

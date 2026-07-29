@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_activity_epoch INTEGER DEFAULT 0,
     is_fork INTEGER DEFAULT 0,
     parent_uuid TEXT DEFAULT '',
-    parent_sid TEXT DEFAULT ''
+    parent_sid TEXT DEFAULT '',
+    first_uuid TEXT DEFAULT ''
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
@@ -75,6 +76,7 @@ END;
 # --- Constants ---
 
 MARKER_RE = re.compile(rb'"type":"(user|assistant|summary|custom-title|ai-title)"')
+_UUID_FIELD_RE = re.compile(rb'"uuid":"([0-9a-fA-F-]{36})"')
 
 NOISE_PREFIXES = (
     "<local-command-caveat>",
@@ -126,6 +128,8 @@ def init_db(db_path=None):
     if "parent_uuid" not in cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN parent_uuid TEXT DEFAULT ''")
         conn.execute("ALTER TABLE sessions ADD COLUMN parent_sid TEXT DEFAULT ''")
+    if "first_uuid" not in cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN first_uuid TEXT DEFAULT ''")
     return conn
 
 
@@ -137,7 +141,7 @@ EFF_EPOCH_SQL = "CASE WHEN last_activity_epoch > 0 THEN last_activity_epoch ELSE
 
 
 def index_session(conn, sid, title, preview, body, project, created_epoch, mtime_epoch, size_bytes=0,
-                  last_activity_epoch=0, is_fork=0, parent_uuid=''):
+                  last_activity_epoch=0, is_fork=0, parent_uuid='', first_uuid=''):
     """Insert or update a session in the database.
 
     parent_sid (the resolved parent session) is preserved across re-indexing —
@@ -145,8 +149,8 @@ def index_session(conn, sid, title, preview, body, project, created_epoch, mtime
     """
     conn.execute("""
         INSERT INTO sessions (sid, title, preview, body, project, created_epoch, mtime_epoch, size_bytes,
-                              last_activity_epoch, is_fork, parent_uuid)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              last_activity_epoch, is_fork, parent_uuid, first_uuid)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(sid) DO UPDATE SET
             title=excluded.title, preview=excluded.preview, body=excluded.body,
             project=excluded.project, created_epoch=excluded.created_epoch,
@@ -154,9 +158,10 @@ def index_session(conn, sid, title, preview, body, project, created_epoch, mtime
             last_activity_epoch=excluded.last_activity_epoch, is_fork=excluded.is_fork,
             parent_sid=CASE WHEN excluded.parent_uuid = sessions.parent_uuid
                             THEN sessions.parent_sid ELSE '' END,
-            parent_uuid=excluded.parent_uuid
+            parent_uuid=excluded.parent_uuid,
+            first_uuid=excluded.first_uuid
     """, (sid, title, preview, body, project, created_epoch, mtime_epoch, size_bytes,
-          last_activity_epoch, is_fork, parent_uuid))
+          last_activity_epoch, is_fork, parent_uuid, first_uuid))
 
 
 # --- Text extraction (from JSONL) ---
@@ -248,6 +253,7 @@ def _extract_one(args):
     compact_fallback = None
     real_user_count = 0
     is_fork = 0
+    first_msg_uuid = None
     body_parts = []
 
     for m in MARKER_RE.finditer(data):
@@ -255,6 +261,10 @@ def _extract_one(args):
 
         if tp == b'user':
             line = _extract_line(data, m.start())
+            if first_msg_uuid is None:
+                um = _UUID_FIELD_RE.search(line)
+                if um:
+                    first_msg_uuid = um.group(1).decode()
             text = _parse_msg_text(line)
             if not text:
                 continue  # skip tool_result-only and empty user messages
@@ -283,6 +293,10 @@ def _extract_one(args):
 
         elif tp == b'assistant':
             line = _extract_line(data, m.start())
+            if first_msg_uuid is None:
+                um = _UUID_FIELD_RE.search(line)
+                if um:
+                    first_msg_uuid = um.group(1).decode()
             if b'"type":"text"' not in line:
                 continue
             gems = _extract_gems(line)
@@ -389,7 +403,7 @@ def _extract_one(args):
             parent_uuid = pm.group(1).decode()
 
     return (mtime, sid, title, preview, body, created_epoch, int(mtime), label, size,
-            last_activity, is_fork, parent_uuid)
+            last_activity, is_fork, parent_uuid, first_msg_uuid or "")
 
 
 # --- Search ---
@@ -623,12 +637,13 @@ def sync_db(conn, files, force_rebuild=False):
     added = 0
     for r in results:
         if r:
-            _, sid, title, preview, body, created, mtime_ep, label, size, last_act, is_fork, puuid = r
+            _, sid, title, preview, body, created, mtime_ep, label, size, last_act, is_fork, puuid, fuuid = r
             index_session(conn, sid, title, preview, body, label, created, mtime_ep, size,
-                          last_act, is_fork, puuid)
+                          last_act, is_fork, puuid, fuuid)
             added += 1
 
     _resolve_parents(conn, file_map)
+    _resolve_duplicates(conn)
     conn.commit()
     return added, len(to_process) - added, removed
 
@@ -664,6 +679,37 @@ def _resolve_parents(conn, file_map):
         if parent_sid:
             conn.execute("UPDATE sessions SET parent_sid = ? WHERE sid = ?",
                          (parent_sid, sid))
+
+
+def _resolve_duplicates(conn):
+    """Link sessions that share a first message uuid into a fork chain.
+
+    Newer Claude Code can continue a conversation under a fresh session id
+    with NO compact_boundary edge (fork-on-resume, bridged/compacted
+    continuations). The copied history keeps its original message uuids, so
+    a shared first-message uuid within a project family identifies one
+    logical conversation. Members are chained oldest -> newest by activity;
+    the normal lineage collapse then offers only the live end. A real
+    compact edge (or an existing link) is never overwritten. Pure SQL — no
+    file access, safe to run every sync.
+    """
+    rows = conn.execute(
+        f"SELECT sid, project, first_uuid, parent_uuid, parent_sid, {EFF_EPOCH_SQL}"
+        " FROM sessions WHERE first_uuid != ''").fetchall()
+    fams = {}
+    for sid, project, fuuid, puuid, psid, eff in rows:
+        base = project.split('--claude-worktrees')[0]
+        fams.setdefault((base, fuuid), []).append((eff, sid, puuid or '', psid or ''))
+    for (_, fuuid), members in fams.items():
+        if len(members) < 2:
+            continue
+        members.sort()
+        for (_, osid, _, _), (_, nsid, npuuid, npsid) in zip(members, members[1:]):
+            if npuuid or npsid:
+                continue  # already linked (compact edge or earlier dup pass)
+            conn.execute(
+                "UPDATE sessions SET parent_uuid = ?, parent_sid = ?, is_fork = 1 WHERE sid = ?",
+                ('dup:' + fuuid, osid, nsid))
 
 
 def lineage_info(conn):

@@ -116,6 +116,7 @@ Two Claude Code behaviors make naive listings lie, and the indexer corrects both
 
 - **File mtime lies.** Claude Code appends metadata (`last-prompt`, `bridge-session`, `ai-title`) to a session file when you merely open it, resurrecting dead sessions to "today". Sorting and dates use the last *message* timestamp instead; mtime only drives incremental sync.
 - **Compaction can fork.** When a conversation is compacted into a new session id, the fork's opening boundary carries a `logicalParentUuid` — a message uuid that exists in exactly one other transcript: the parent. The indexer resolves that edge once (searching sibling project files, worktree folders included), caches it, and collapses chains at display time. A parent resumed *after* its fork (genuinely divergent branches) keeps both branches visible.
+- **Continuations aren't always marked.** Some flows copy a conversation into a fresh session id with *no* boundary marker at all (fork-on-resume, bridged continuations). The copied history keeps its original message uuids, so sessions sharing their first message uuid within a project are treated as one conversation and collapse the same way — superseded copies hide, sizes accumulate, search redirects to the live end.
 
 ### Data
 
@@ -224,10 +225,10 @@ Add `~/.raycast-scripts/` as a script directory in Raycast preferences.
 ## Testing
 
 ```bash
-# Search ranking + fork lineage tests (34 tests)
+# Search ranking + fork lineage tests (40 tests)
 python3 test_search.py
 
-# Full integration tests — indexer, search, preview (47 tests)
+# Full integration tests — indexer, search, preview (60 tests)
 bash test-session-tools.sh
 
 # Resume directory resolution tests (13 tests)
@@ -239,7 +240,7 @@ bash test-app.sh
 
 `test-app.sh` builds the app, points it at generated fixtures, and runs its `SP_SELFTEST=1` mode: panel shows → indexer returns rows → preview renders → the opener resolves a resume command. Exits nonzero on any failure.
 
-94 tests covering: exact phrases, short tokens, field weighting, BM25 frequency, IDF, recency tiebreakers, negation, project filters, tool_use exclusion, preview matching, compacted sessions, fork-chain collapse, and resume-dir resolution (deleted worktrees, relocated transcripts).
+110+ tests covering: exact phrases, short tokens, field weighting, BM25 frequency, IDF, recency tiebreakers, negation, project filters, tool_use exclusion, preview matching, compacted sessions, fork-chain collapse, unmarked-continuation dedup, and resume-dir resolution (deleted worktrees, relocated transcripts).
 
 ## Roadmap
 
