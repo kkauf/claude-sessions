@@ -89,10 +89,11 @@ NOISE_PREFIXES = (
 )
 
 # Machine-spawned sessions the user never resumes by hand (code-review/security
-# runs, automated probes, bare slash-command artifacts, alert crons). They're
-# still indexed and findable via explicit search, but hidden from the default
-# recency listing so real work isn't buried. Set SESSIONS_INCLUDE_AUTOMATED=1
-# to show them. Matched case-sensitively against the session preview.
+# runs, automated probes, bare slash-command artifacts, alert crons). Hidden
+# from browsing AND search so real work isn't buried — their ai-titles match
+# ordinary work queries ("Review email outreach campaign for security issues"
+# hits "email"). Set SESSIONS_INCLUDE_AUTOMATED=1 to show them. Matched
+# case-sensitively against the session preview.
 AUTOMATED_PREVIEW_PATTERNS = (
     "Review this change for security",   # /code-review, /security-review
     "Reply with only:",                  # automated probes / keepalives
@@ -487,6 +488,8 @@ def search(conn, query, limit=200):
     results = []
     for sid, title, preview, body, project, created, mtime, size_bytes, is_fork in rows:
         if project_filter and project_filter not in project.lower():
+            continue
+        if not SHOW_AUTOMATED and is_automated(preview):
             continue
         if exclude_terms:
             combined = f"{title} {preview} {body}".lower()

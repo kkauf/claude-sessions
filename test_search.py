@@ -10,7 +10,8 @@ Run: python3 test_search.py
 import os, sys, tempfile, unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
-from session_indexer import init_db, index_session, search, lineage_info, _resolve_duplicates
+from session_indexer import (init_db, index_session, search, lineage_info,
+                             _resolve_duplicates, is_automated)
 
 
 class SearchTestCase(unittest.TestCase):
@@ -412,6 +413,28 @@ class TestDuplicateContinuations(SearchTestCase):
         self.conn.commit()
         hidden, _, _ = lineage_info(self.conn)
         self.assertEqual(hidden, set())
+
+
+class TestAutomatedSessions(SearchTestCase):
+    """Machine-spawned sessions (security reviews, probes) stay out of search.
+
+    Their ai-titles match ordinary work queries — a headless security review
+    titled "Review email outreach campaign for security issues" must not
+    surface for "email".
+    """
+
+    def test_automated_session_hidden_from_search(self):
+        self.add('secreview', title='Review email outreach campaign for security issues',
+                 preview='Review this change for security vulnerabilities. Changed files',
+                 body='email outreach campaign security diff')
+        self.add('realwork', preview='fix the email sender',
+                 body='email outreach campaign work')
+        self.assertEqual(self.all_sids('email'), ['realwork'])
+
+    def test_is_automated_patterns(self):
+        self.assertTrue(is_automated('Review this change for security vulnerabilities. x'))
+        self.assertTrue(is_automated('Reply with only: OK'))
+        self.assertFalse(is_automated('Review my email draft please'))
 
 
 if __name__ == '__main__':
