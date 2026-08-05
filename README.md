@@ -160,9 +160,54 @@ All logic stays in the CLI — the app shells out to `session_indexer.py --json`
 ```bash
 python3 session_indexer.py --json                      # browse rows as JSON
 python3 session_indexer.py --json --search "auth bug"  # search rows as JSON
+python3 session_map_export.py                          # full map + token usage -> ~/.claude/.sessions-map.json
 claude-sessions open <sid>                             # resolve dir + resume in iTerm
 claude-sessions open <sid> --print                     # print the resume command instead
 ```
+
+#### Session map + token usage
+
+`session_map_export.py` writes one JSON document describing every session *and*
+what it cost — for dashboards, usage charts, or any front-end that wants more
+than a picker list. Token counts come from the transcripts themselves (each
+assistant message carries a `message.usage` block); index rows supply identity,
+project, and fork lineage.
+
+```bash
+python3 session_map_export.py                     # -> ~/.claude/.sessions-map.json
+python3 session_map_export.py -o /tmp/map.json    # alternate destination
+python3 session_map_export.py --include-automated  # keep machine-spawned sessions
+```
+
+```jsonc
+{
+  "version": 1,
+  "generated_at": 1780000000,
+  "projects": [{"name": "myrepo", "sessions": 344, "tokens_input": 8328957, "tokens_output": 57924049}],
+  "sessions": [{
+    "sid": "…", "title": "…", "preview": "…",   // preview capped at 300 chars
+    "project": "myrepo",                          // worktree folders collapse to the base repo
+    "created": 1770000000, "eff": 1780000000,     // eff = last *message* activity
+    "size_bytes": 61337319, "parent_sid": "…",
+    "hidden": 0,                                  // 1 = superseded fork ancestor (render hidden=0 only)
+    "tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}
+  }],
+  "daily": [{"date": "2026-03-04", "project": "myrepo",
+             "input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}]
+}
+```
+
+Sessions are sorted by `eff` descending, `daily` by date ascending. Hidden
+ancestors stay in the export and their tokens count toward `daily` and project
+token totals; `projects[].sessions` counts only what a front-end renders.
+Automated sessions (headless security reviews, probes) are excluded by default,
+tokens included.
+
+Parsing every transcript is a multi-GB read, so per-day usage is cached in its
+own database (`~/.claude/.sessions-usage.db`, never `.sessions.db`) keyed on
+each file's mtime + size. Only changed transcripts are re-parsed — a cold run is
+bounded by disk IO, a warm run is a fraction of a second. Delete that file to
+force a full re-parse.
 
 ## Launch methods
 
@@ -225,8 +270,11 @@ Add `~/.raycast-scripts/` as a script directory in Raycast preferences.
 ## Testing
 
 ```bash
-# Search ranking + fork lineage tests (40 tests)
+# Search ranking + fork lineage tests (42 tests)
 python3 test_search.py
+
+# Session map export — token accounting, incremental cache (22 tests)
+python3 test_map_export.py
 
 # Full integration tests — indexer, search, preview (60 tests)
 bash test-session-tools.sh
@@ -240,7 +288,7 @@ bash test-app.sh
 
 `test-app.sh` builds the app, points it at generated fixtures, and runs its `SP_SELFTEST=1` mode: panel shows → indexer returns rows → preview renders → the opener resolves a resume command. Exits nonzero on any failure.
 
-110+ tests covering: exact phrases, short tokens, field weighting, BM25 frequency, IDF, recency tiebreakers, negation, project filters, tool_use exclusion, preview matching, compacted sessions, fork-chain collapse, unmarked-continuation dedup, and resume-dir resolution (deleted worktrees, relocated transcripts).
+130+ tests covering: exact phrases, short tokens, field weighting, BM25 frequency, IDF, recency tiebreakers, negation, project filters, tool_use exclusion, preview matching, compacted sessions, fork-chain collapse, unmarked-continuation dedup, resume-dir resolution (deleted worktrees, relocated transcripts), and token accounting (streaming-duplicate dedup, date attribution, incremental re-parse).
 
 ## Roadmap
 
